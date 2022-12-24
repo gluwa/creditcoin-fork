@@ -1,19 +1,24 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 use std::{collections::HashSet, fmt::Debug, path::PathBuf, str::FromStr};
 
 use clap::Parser;
 use color_eyre::Result;
 use color_eyre::{eyre::eyre, Report};
 use extend::ext;
+use futures::{pin_mut, TryStream, TryStreamExt};
+use jsonrpsee::client_transport::ws::{Receiver, Sender, Uri, WsTransportClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sp_core::{hashing::twox_128, Encode, H256};
 use subxt::config::WithExtrinsicParams;
+use subxt::storage::StorageKey;
 use subxt::tx::{BaseExtrinsicParams, PlainTip};
 use subxt::{OnlineClient, SubstrateConfig};
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 
 pub type ExtrinsicParams = BaseExtrinsicParams<SubstrateConfig, PlainTip>;
 
@@ -124,39 +129,63 @@ impl<Slice: AsRef<[u8]>> Slice {
     }
 }
 
+fn key_stream<'a, 'h>(
+    api: &'a ApiClient,
+    at: &'a H256,
+    sema: Arc<Semaphore>,
+) -> impl TryStream<Ok = StorageKey, Error = Report> + 'a {
+    Box::pin(async_stream::try_stream! {
+        let mut start: Option<StorageKey> = None;
+        loop {
+            let keys = {
+                let _permit = sema.acquire().await?;
+                api.rpc().storage_keys_paged(&[], 512, start.map(|k| k.0).as_deref(), Some(at.clone())).await.dbg_err()?
+            };
+            start = keys.last().map(|k| k.clone());
+            if keys.is_empty() {
+                break;
+            }
+            for key in keys {
+                yield key;
+            }
+        }
+    })
+}
+
+const MAX_CONCURRENT_REQUESTS: usize = 2048;
+
 async fn fetch_storage_pairs(api: &ApiClient, at: &H256) -> Result<StoragePairs> {
-    let mut all_values = Vec::new();
-    let mut all_keys = Vec::new();
-    let mut keys = api
-        .rpc()
-        .storage_keys_paged(&[], 512, None, Some(at.clone()))
-        .await
-        .dbg_err()?;
-    while !keys.is_empty() {
-        let last = keys.last().unwrap().clone();
-        println!("{}", last.0.to_hex());
-        for key in &keys {
+    let sema = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
+
+    let keys = key_stream(api, at, sema.clone());
+    pin_mut!(keys);
+
+    let mut futs = Vec::new();
+
+    while let Some(key) = keys.try_next().await? {
+        let api = api.clone();
+        let at = at.clone();
+        let sema = sema.clone();
+        futs.push(tokio::spawn(async move {
+            let _permit = sema.acquire().await?;
             let value = api
                 .rpc()
                 .storage(&key.0, Some(at.clone()))
                 .await
                 .dbg_err()?
                 .unwrap();
-            all_values.push(value);
-        }
-        all_keys.extend(keys);
-        keys = api
-            .rpc()
-            .storage_keys_paged(&[], 512, Some(last.0.as_slice()), Some(at.clone()))
-            .await
-            .dbg_err()?;
+
+            Ok::<_, Report>(StoragePair(key.to_hex(), value.0.to_hex()))
+        }));
     }
 
-    Ok(all_keys
-        .into_iter()
-        .zip(all_values.into_iter())
-        .map(|(key, value)| StoragePair(key.to_hex(), value.0.to_hex()))
-        .collect())
+    let mut pairs = Vec::new();
+    for fut in futs {
+        let pair = fut.await??;
+        pairs.push(pair);
+    }
+
+    Ok(pairs)
 }
 
 fn storage_prefix(module: &str, name: &str) -> String {
@@ -257,6 +286,25 @@ async fn fetch_storage_at(api: &ApiClient, at: Option<H256>) -> Result<StoragePa
     fetch_storage_pairs(&api, &at).await
 }
 
+async fn ws_transport(url: &str) -> Result<(Sender, Receiver)> {
+    let url: Uri = url.parse().err_into()?;
+    WsTransportClientBuilder::default()
+        .build(url)
+        .await
+        .err_into()
+}
+
+async fn new_client() -> Result<ApiClient> {
+    let (sender, receiver) = ws_transport("ws://127.0.0.1:9944").await?;
+    let client = Arc::new(
+        jsonrpsee::async_client::ClientBuilder::default()
+            .max_concurrent_requests(MAX_CONCURRENT_REQUESTS)
+            .build_with_tokio(sender, receiver),
+    );
+    let api = ApiClient::from_rpc_client(client).await?;
+    Ok(api)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -269,7 +317,8 @@ async fn main() -> Result<()> {
                 println!("using existing storage");
                 serde_json::from_slice(&storage)?
             } else {
-                let api = ApiClient::new().await?;
+                let api = new_client().await?;
+                // let api = ApiClient::new().await?;
                 let storage = fetch_storage_at(&api, cli.at).await?;
                 let storage_bytes = serde_json::to_vec(&storage)?;
                 tokio::fs::write(&path, storage_bytes).await?;
@@ -277,7 +326,7 @@ async fn main() -> Result<()> {
             }
         }
         None => {
-            let api = ApiClient::new().await?;
+            let api = new_client().await?;
             fetch_storage_at(&api, cli.at).await?
         }
     };
