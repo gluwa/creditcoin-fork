@@ -111,7 +111,7 @@ impl<Slice: AsRef<[u8]>> Slice {
     }
 }
 
-fn key_stream<'a, 'h>(
+fn key_stream<'a>(
     api: &'a ApiClient,
     at: &'a H256,
     sema: Arc<Semaphore>,
@@ -146,13 +146,13 @@ async fn fetch_storage_pairs(api: &ApiClient, at: &H256) -> Result<StoragePairs>
 
     while let Some(key) = keys.try_next().await? {
         let api = api.clone();
-        let at = at.clone();
+        let at = *at;
         let sema = sema.clone();
         futs.push(tokio::spawn(async move {
             let _permit = sema.acquire().await?;
             let value = api
                 .rpc()
-                .storage(&key.0, Some(at.clone()))
+                .storage(&key.0, Some(at))
                 .await
                 .dbg_err()?
                 .unwrap();
@@ -279,7 +279,7 @@ async fn build_spec(binary: &Path, chain: Chain) -> Result<ChainSpec> {
 async fn read_wasm_hex(wasm_path: &Path) -> Result<String> {
     let wasm = tokio::fs::read(wasm_path).await?;
     let mut wasm_hex = "0x".to_owned();
-    wasm_hex.push_str(&hex::encode(&wasm).trim());
+    wasm_hex.push_str(hex::encode(wasm).trim());
 
     Ok(wasm_hex)
 }
@@ -294,7 +294,7 @@ async fn fetch_storage_at(api: &ApiClient, at: Option<H256>) -> Result<StoragePa
             .ok_or_else(|| eyre!("failed to get latest block hash"))?
     };
 
-    fetch_storage_pairs(&api, &at).await
+    fetch_storage_pairs(api, &at).await
 }
 
 async fn ws_transport(url: Uri) -> Result<(Sender, Receiver)> {
@@ -323,23 +323,20 @@ async fn main() -> Result<()> {
 
     let rpc_url = cli.rpc;
 
-    let storage = match cli.storage {
-        Some(path) => {
-            if let Ok(storage) = tokio::fs::read(&path).await {
-                println!("using existing storage");
-                serde_json::from_slice(&storage)?
-            } else {
-                let api = new_client(rpc_url.clone()).await?;
-                let storage = fetch_storage_at(&api, cli.at).await?;
-                let storage_bytes = serde_json::to_vec(&storage)?;
-                tokio::fs::write(&path, storage_bytes).await?;
-                storage
-            }
-        }
-        None => {
+    let storage = if let Some(path) = cli.storage {
+        if let Ok(storage) = tokio::fs::read(&path).await {
+            println!("using existing storage");
+            serde_json::from_slice(&storage)?
+        } else {
             let api = new_client(rpc_url.clone()).await?;
-            fetch_storage_at(&api, cli.at).await?
+            let storage = fetch_storage_at(&api, cli.at).await?;
+            let storage_bytes = serde_json::to_vec(&storage)?;
+            tokio::fs::write(&path, storage_bytes).await?;
+            storage
         }
+    } else {
+        let api = new_client(rpc_url.clone()).await?;
+        fetch_storage_at(&api, cli.at).await?
     };
 
     let orig_spec = build_spec(&cli.binary, cli.original_chain).await?;
@@ -359,14 +356,14 @@ async fn main() -> Result<()> {
         storage_prefix("System", "Account"), // System.Account
     ];
     if let Some(pallets) = cli.pallets {
-        prefixes.extend(pallets.iter().map(|n| module_prefix(n)))
+        prefixes.extend(pallets.iter().map(|n| module_prefix(n)));
     } else {
         let api = ApiClient::<CreditcoinConfig>::from_url(rpc_url.to_string()).await?;
         let meta = api.rpc().metadata().await?;
         for pallet in &meta.runtime_metadata().pallets {
             let n = &pallet.name;
             if pallet.storage.is_some() && !exclude.contains(n.as_str()) {
-                let hashed = module_prefix(&n);
+                let hashed = module_prefix(n);
                 prefixes.push(hashed);
             }
         }
@@ -374,31 +371,31 @@ async fn main() -> Result<()> {
 
     for (key, value) in &storage {
         if prefixes.iter().any(|p| key.starts_with(p)) {
-            spec.set_state(key, value.to_owned());
+            spec.set_state(key, value.clone());
         }
     }
 
     let wasm_hex = if let Some(runtime_path) = &cli.runtime {
-        read_wasm_hex(&runtime_path).await?
+        read_wasm_hex(runtime_path).await?
     } else {
         storage
             .get(&*b":code".to_hex())
             .expect("storage should include the runtime code")
-            .to_owned()
+            .clone()
     };
 
     // make sure to remove System.LastRuntimeUpgrade to trigger a migration
     spec.remove_state(storage_prefix("System", "LastRuntimeUpgrade"));
 
     // Overwrite the on-chain wasm blob
-    spec.set_state(&b":code".to_hex(), wasm_hex);
+    spec.set_state(b":code".to_hex(), wasm_hex);
 
     // Make sure that the genesis state is different
     spec.set_state("0xdeadbeef", "0x1");
 
     // set the sudo key to Alice
     spec.set_state(
-        &storage_prefix("Sudo", "Key"),
+        storage_prefix("Sudo", "Key"),
         "0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d".to_owned(),
     );
     spec.boot_nodes = vec![];
