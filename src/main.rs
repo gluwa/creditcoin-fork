@@ -24,7 +24,7 @@ pub type ExtrinsicParams = BaseExtrinsicParams<SubstrateConfig, PlainTip>;
 
 pub type CreditcoinConfig = WithExtrinsicParams<SubstrateConfig, ExtrinsicParams>;
 
-pub type ApiClient = OnlineClient<CreditcoinConfig>;
+pub type ApiClient<C = CreditcoinConfig> = OnlineClient<C>;
 
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
 struct StoragePair(String, String);
@@ -47,23 +47,6 @@ where
 {
     fn err_into(self) -> Result<T, Report> {
         self.map_err(Into::into)
-    }
-}
-
-#[derive(PartialEq, Eq, Debug)]
-struct SortPriority<T>(usize, T);
-
-impl<T> PartialOrd for SortPriority<T>
-where
-    T: PartialEq,
-{
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(&other.0)
-    }
-}
-impl<T: Eq> Ord for SortPriority<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
     }
 }
 
@@ -201,20 +184,39 @@ fn module_prefix(module: &str) -> String {
 
 #[derive(clap::Parser)]
 struct Cli {
+    /// Path to the creditcoin-node binary to use
+    /// for chain-spec creation.
     #[clap(long = "bin")]
     binary: PathBuf,
+    /// Path to the runtime WASM blob to use
+    /// in the forked chain.
     #[clap(long)]
     runtime: PathBuf,
+    /// Path to write the fork's chain-spec to
     #[clap(short, long)]
     out: Option<PathBuf>,
+    /// Name of the original chain to fork from
+    /// (e.g. "dev", "test", "main")
     #[clap(long = "orig")]
     original_chain: Chain,
+    /// Name of the chain to use as the base for the fork's
+    /// chain-spec
     #[clap(long = "new", default_value_t = Chain::Dev)]
     new_chain: Chain,
+    /// Path to the cached runtime storage file. If passed
+    /// and the file does not exist, the chain's state will
+    /// be fetched and written to the given path. If the file
+    /// does exist, the state in the file will be used. If omitted,
+    /// state will be fetched from a running node and will not be
+    /// saved to a file.
     #[clap(long)]
     storage: Option<PathBuf>,
+    /// Block hash to fetch the on-chain state from.
     #[clap(long)]
     at: Option<H256>,
+
+    /// A list of pallets to keep state from. If omitted,
+    /// most pallets with runtime storage will maintain their state
     #[clap(long)]
     pallets: Option<Vec<String>>,
 }
@@ -338,19 +340,9 @@ async fn main() -> Result<()> {
     spec.id = orig_spec.id.joined_with("-fork");
     spec.protocol_id = orig_spec.protocol_id.clone();
 
-    let exclude: HashSet<&str> = [
-        "System",
-        "Session",
-        "Babe",
-        "Grandpa",
-        "GrandpaFinality",
-        "FinalityTracker",
-        "Authorship",
-        "Difficulty",
-        "Rewards",
-    ]
-    .into_iter()
-    .collect();
+    let exclude: HashSet<&str> = ["System", "Authorship", "Difficulty", "Rewards"]
+        .into_iter()
+        .collect();
 
     let mut prefixes = vec![
         storage_prefix("System", "Account"), // System.Account
@@ -358,7 +350,7 @@ async fn main() -> Result<()> {
     if let Some(pallets) = cli.pallets {
         prefixes.extend(pallets.iter().map(|n| module_prefix(n)))
     } else {
-        let api = ApiClient::new().await?;
+        let api = ApiClient::<CreditcoinConfig>::new().await?;
         let meta = api.rpc().metadata().await?;
         for pallet in &meta.runtime_metadata().pallets {
             let n = &pallet.name;
@@ -377,7 +369,7 @@ async fn main() -> Result<()> {
 
     let wasm_hex = read_wasm_hex(&cli.runtime).await?;
 
-    // remove System.LastRuntimeUpgrade to trigger a migration (why is this desirable??)
+    // remove System.LastRuntimeUpgrade to trigger a migration (ported from fork-off-substrate - not 100% sure why is this desirable??)
     spec.remove_state(storage_prefix("System", "LastRuntimeUpgrade"));
 
     // Overwrite the on-chain wasm blob
