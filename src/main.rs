@@ -9,6 +9,7 @@ use color_eyre::Result;
 use color_eyre::{eyre::eyre, Report};
 use extend::ext;
 use futures::{pin_mut, TryStream, TryStreamExt};
+use fxhash::FxHashMap;
 use jsonrpsee::client_transport::ws::{Receiver, Sender, Uri, WsTransportClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -26,9 +27,7 @@ pub type CreditcoinConfig = WithExtrinsicParams<SubstrateConfig, ExtrinsicParams
 
 pub type ApiClient<C = CreditcoinConfig> = OnlineClient<C>;
 
-#[derive(serde::Deserialize, serde::Serialize, Debug)]
-struct StoragePair(String, String);
-type StoragePairs = Vec<StoragePair>;
+type StoragePairs = FxHashMap<String, String>;
 
 #[ext]
 impl<T, E> Result<T, E>
@@ -158,14 +157,14 @@ async fn fetch_storage_pairs(api: &ApiClient, at: &H256) -> Result<StoragePairs>
                 .dbg_err()?
                 .unwrap();
 
-            Ok::<_, Report>(StoragePair(key.to_hex(), value.0.to_hex()))
+            Ok::<_, Report>((key.to_hex(), value.0.to_hex()))
         }));
     }
 
-    let mut pairs = Vec::new();
+    let mut pairs = FxHashMap::default();
     for fut in futs {
-        let pair = fut.await??;
-        pairs.push(pair);
+        let (k, v) = fut.await??;
+        pairs.insert(k, v);
     }
 
     Ok(pairs)
@@ -189,20 +188,20 @@ struct Cli {
     #[clap(long = "bin")]
     binary: PathBuf,
     /// Path to the runtime WASM blob to use
-    /// in the forked chain.
+    /// in the forked chain. If omitted this will
     #[clap(long)]
-    runtime: PathBuf,
+    runtime: Option<PathBuf>,
     /// Path to write the fork's chain-spec to
-    #[clap(short, long)]
-    out: Option<PathBuf>,
+    #[clap(short, long, default_value = "fork.json")]
+    out: PathBuf,
     /// Name of the original chain to fork from
     /// (e.g. "dev", "test", "main")
     #[clap(long = "orig")]
     original_chain: Chain,
     /// Name of the chain to use as the base for the fork's
     /// chain-spec
-    #[clap(long = "new", default_value_t = Chain::Dev)]
-    new_chain: Chain,
+    #[clap(long = "base", default_value_t = Chain::Dev)]
+    base_chain: Chain,
     /// Path to the cached runtime storage file. If passed
     /// and the file does not exist, the chain's state will
     /// be fetched and written to the given path. If the file
@@ -214,6 +213,16 @@ struct Cli {
     /// Block hash to fetch the on-chain state from.
     #[clap(long)]
     at: Option<H256>,
+    /// Name for the new, forked chain. Defaults to `{original}-fork`.
+    #[clap(long)]
+    name: Option<String>,
+    /// Chain ID for the new, forked chain. Defaults to `{original}-fork`.
+    #[clap(long)]
+    id: Option<String>,
+
+    /// Url for the live node from which to pull state and other required data.
+    #[clap(long, default_value = "ws://127.0.0.1:9944")]
+    rpc: Uri,
 
     /// A list of pallets to keep state from. If omitted,
     /// most pallets with runtime storage will maintain their state
@@ -288,16 +297,15 @@ async fn fetch_storage_at(api: &ApiClient, at: Option<H256>) -> Result<StoragePa
     fetch_storage_pairs(&api, &at).await
 }
 
-async fn ws_transport(url: &str) -> Result<(Sender, Receiver)> {
-    let url: Uri = url.parse().err_into()?;
+async fn ws_transport(url: Uri) -> Result<(Sender, Receiver)> {
     WsTransportClientBuilder::default()
         .build(url)
         .await
         .err_into()
 }
 
-async fn new_client() -> Result<ApiClient> {
-    let (sender, receiver) = ws_transport("ws://127.0.0.1:9944").await?;
+async fn new_client(url: Uri) -> Result<ApiClient> {
+    let (sender, receiver) = ws_transport(url).await?;
     let client = Arc::new(
         jsonrpsee::async_client::ClientBuilder::default()
             .max_concurrent_requests(MAX_CONCURRENT_REQUESTS)
@@ -313,14 +321,15 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    let rpc_url = cli.rpc;
+
     let storage = match cli.storage {
         Some(path) => {
             if let Ok(storage) = tokio::fs::read(&path).await {
                 println!("using existing storage");
                 serde_json::from_slice(&storage)?
             } else {
-                let api = new_client().await?;
-                // let api = ApiClient::new().await?;
+                let api = new_client(rpc_url.clone()).await?;
                 let storage = fetch_storage_at(&api, cli.at).await?;
                 let storage_bytes = serde_json::to_vec(&storage)?;
                 tokio::fs::write(&path, storage_bytes).await?;
@@ -328,16 +337,18 @@ async fn main() -> Result<()> {
             }
         }
         None => {
-            let api = new_client().await?;
+            let api = new_client(rpc_url.clone()).await?;
             fetch_storage_at(&api, cli.at).await?
         }
     };
 
     let orig_spec = build_spec(&cli.binary, cli.original_chain).await?;
-    let mut spec = build_spec(&cli.binary, cli.new_chain).await?;
+    let mut spec = build_spec(&cli.binary, cli.base_chain).await?;
 
-    spec.name = orig_spec.name.joined_with("-fork");
-    spec.id = orig_spec.id.joined_with("-fork");
+    spec.name = cli
+        .name
+        .unwrap_or_else(|| orig_spec.name.joined_with("-fork"));
+    spec.id = cli.id.unwrap_or_else(|| orig_spec.id.joined_with("-fork"));
     spec.protocol_id = orig_spec.protocol_id.clone();
 
     let exclude: HashSet<&str> = ["System", "Authorship", "Difficulty", "Rewards"]
@@ -350,7 +361,7 @@ async fn main() -> Result<()> {
     if let Some(pallets) = cli.pallets {
         prefixes.extend(pallets.iter().map(|n| module_prefix(n)))
     } else {
-        let api = ApiClient::<CreditcoinConfig>::new().await?;
+        let api = ApiClient::<CreditcoinConfig>::from_url(rpc_url.to_string()).await?;
         let meta = api.rpc().metadata().await?;
         for pallet in &meta.runtime_metadata().pallets {
             let n = &pallet.name;
@@ -361,19 +372,29 @@ async fn main() -> Result<()> {
         }
     }
 
-    for StoragePair(key, value) in &storage {
+    for (key, value) in &storage {
         if prefixes.iter().any(|p| key.starts_with(p)) {
             spec.set_state(key, value.to_owned());
         }
     }
 
-    let wasm_hex = read_wasm_hex(&cli.runtime).await?;
+    let wasm_hex = if let Some(runtime_path) = &cli.runtime {
+        read_wasm_hex(&runtime_path).await?
+    } else {
+        storage
+            .get(&*b":code".to_hex())
+            .expect("storage should include the runtime code")
+            .to_owned()
+    };
 
-    // remove System.LastRuntimeUpgrade to trigger a migration (ported from fork-off-substrate - not 100% sure why is this desirable??)
+    // make sure to remove System.LastRuntimeUpgrade to trigger a migration
     spec.remove_state(storage_prefix("System", "LastRuntimeUpgrade"));
 
     // Overwrite the on-chain wasm blob
     spec.set_state(&b":code".to_hex(), wasm_hex);
+
+    // Make sure that the genesis state is different
+    spec.set_state("0xdeadbeef", "0x1");
 
     // set the sudo key to Alice
     spec.set_state(
@@ -387,11 +408,7 @@ async fn main() -> Result<()> {
         6000u64.encode().to_hex(),
     );
 
-    tokio::fs::write(
-        cli.out.unwrap_or("fork.json".into()),
-        serde_json::to_vec_pretty(&spec)?,
-    )
-    .await?;
+    tokio::fs::write(cli.out, serde_json::to_vec_pretty(&spec)?).await?;
 
     println!("Done!");
 
