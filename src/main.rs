@@ -1,9 +1,10 @@
+mod cli;
+
 use std::ffi::OsStr;
-use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{collections::HashSet, fmt::Debug, path::PathBuf, str::FromStr};
+use std::{collections::HashSet, fmt::Debug};
 
 use clap::Parser;
 use color_eyre::Result;
@@ -12,7 +13,6 @@ use console::style;
 use extend::ext;
 use futures::{TryStream, TryStreamExt};
 use fxhash::FxHashMap;
-use indicatif::ProgressStyle;
 use jsonrpsee::client_transport::ws::{Receiver, Sender, Uri, WsTransportClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -114,51 +114,14 @@ impl<Slice: AsRef<[u8]>> Slice {
     }
 }
 
-fn make_spinner(bounce_width: usize, bar_width: usize) -> Vec<String> {
-    let mut steps = Vec::new();
-
-    fn make_bounce_string(pos: isize, bounce_width: isize, bar_width: isize) -> String {
-        let mut bounce = String::from("[");
-        for p in 0..bar_width.max(2) - 2 {
-            if p >= pos && p < pos + bounce_width {
-                bounce.push('=');
-            } else {
-                bounce.push(' ');
-            }
-        }
-        bounce.push(']');
-        bounce
-    }
-
-    let bounce_width: isize = bounce_width.try_into().unwrap();
-    let bar_width: isize = bar_width.try_into().unwrap();
-    let bar_content_width: isize = bar_width.max(2) - 2;
-
-    let mut pos: isize = -bounce_width;
-    while pos < bar_content_width {
-        steps.push(make_bounce_string(pos, bounce_width, bar_width));
-        pos += 1;
-    }
-    while pos > -bounce_width {
-        steps.push(make_bounce_string(pos, bounce_width, bar_width));
-        pos -= 1;
-    }
-
-    steps
-}
-
 fn key_stream<'a>(
     api: &'a ApiClient,
     at: &'a H256,
     sema: Arc<Semaphore>,
 ) -> impl TryStream<Ok = StorageKey, Error = Report> + 'a {
     Box::pin(async_stream::try_stream! {
-        let sp = make_spinner(10, 40);
-        let sp_slice: Vec<&str> = sp.iter().map(|s| s.as_str()).collect();
         let mut start: Option<StorageKey> = None;
-        let spinner = indicatif::ProgressBar::new_spinner().with_style(ProgressStyle::with_template("{msg:23.green} {spinner} [{elapsed:.cyan}] ({per_sec:>12.magenta})")?.tick_strings(sp_slice.as_slice())).with_message("Fetching storage keys");
-        let mut count: u64 = 0;
-        let mut last_update = Instant::now();
+        let mut spinner = cli::ProgressBarManager::new_spinner("Fetching storage keys")?;
         loop {
             let keys = {
                 let _permit = sema.acquire().await?;
@@ -169,13 +132,7 @@ fn key_stream<'a>(
                 spinner.finish_with_message("Done");
                 break;
             }
-            count += u64::try_from(keys.len()).unwrap();
-            const TICK_INTERVAL: Duration = Duration::from_millis(100);
-            if last_update.elapsed() >= TICK_INTERVAL {
-                spinner.inc(count);
-                count = 0;
-                last_update = Instant::now();
-            }
+            spinner.inc(u64::try_from(keys.len()).unwrap());
             for key in keys {
                 yield key;
             }
@@ -191,14 +148,10 @@ async fn fetch_storage_pairs(api: &ApiClient, at: &H256) -> Result<StoragePairs>
     let keys = key_stream(api, at, sema.clone());
     let keys: Vec<_> = keys.try_collect().await?;
 
-    let bar = indicatif::ProgressBar::new(keys.len() as u64)
-        .with_style(
-            ProgressStyle::with_template(
-                "{msg:.green} [{bar:38}] {human_pos:>7.blue}/{human_len:7.blue} [{elapsed:.cyan}] ({per_sec:.magenta})",
-            )?
-            .progress_chars("=> "),
-        )
-        .with_message("Fetching storage values");
+    let mut bar = cli::ProgressBarManager::new_bar(
+        keys.len().try_into().unwrap(),
+        "Fetching storage values",
+    )?;
 
     let mut futs = Vec::new();
 
@@ -226,18 +179,17 @@ async fn fetch_storage_pairs(api: &ApiClient, at: &H256) -> Result<StoragePairs>
     let mut last_update = Instant::now();
     for fut in futs {
         let (k, v) = fut.await??;
-        let bar = bar.clone();
         count += 1;
         const TICK_INTERVAL: Duration = Duration::from_millis(100);
         if last_update.elapsed() >= TICK_INTERVAL {
-            tokio::task::spawn_blocking(move || bar.inc(count));
+            bar.inc(count);
             count = 0;
             last_update = Instant::now();
         }
         pairs.insert(k, v);
     }
 
-    bar.finish();
+    bar.finish_with_message("Done");
 
     Ok(pairs)
 }
@@ -253,79 +205,10 @@ fn module_prefix(module: &str) -> String {
     twox_128(module.as_bytes()).to_hex()
 }
 
-#[derive(clap::Parser)]
-struct Cli {
-    /// Path to the creditcoin-node binary to use
-    /// for chain-spec creation.
-    #[clap(long = "bin")]
-    binary: PathBuf,
-    /// Path to the runtime WASM blob to use
-    /// in the forked chain. If omitted this will
-    #[clap(long)]
-    runtime: Option<PathBuf>,
-    /// Path to write the fork's chain-spec to
-    #[clap(short, long, default_value = "fork.json")]
-    out: PathBuf,
-    /// Name of the original chain to fork from
-    /// (e.g. "dev", "test", "main")
-    #[clap(long = "orig")]
-    original_chain: Chain,
-    /// Name of the chain to use as the base for the fork's
-    /// chain-spec
-    #[clap(long = "base", default_value_t = Chain::Dev)]
-    base_chain: Chain,
-    /// Path to the cached runtime storage file. If passed
-    /// and the file does not exist, the chain's state will
-    /// be fetched and written to the given path. If the file
-    /// does exist, the state in the file will be used. If omitted,
-    /// state will be fetched from a running node and will not be
-    /// saved to a file.
-    #[clap(long)]
-    storage: Option<PathBuf>,
-    /// Block hash to fetch the on-chain state from.
-    #[clap(long)]
-    at: Option<H256>,
-    /// Name for the new, forked chain. Defaults to `{original}-fork`.
-    #[clap(long)]
-    name: Option<String>,
-    /// Chain ID for the new, forked chain. Defaults to `{original}-fork`.
-    #[clap(long)]
-    id: Option<String>,
-
-    /// Url for the live node from which to pull state and other required data.
-    #[clap(long, default_value = "ws://127.0.0.1:9944")]
-    rpc: Uri,
-
-    /// A list of pallets to keep state from. If omitted,
-    /// most pallets with runtime storage will maintain their state
-    #[clap(long)]
-    pallets: Option<Vec<String>>,
-}
-
 #[derive(Clone, Debug, PartialEq)]
-enum Chain {
+pub enum Chain {
     Dev,
     Other(String),
-}
-
-impl fmt::Display for Chain {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Chain::Dev => write!(f, "dev"),
-            Chain::Other(c) => write!(f, "{c}"),
-        }
-    }
-}
-
-impl FromStr for Chain {
-    type Err = Report;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s.to_lowercase().as_str() {
-            "dev" => Chain::Dev,
-            _ => Chain::Other(s.to_owned()),
-        })
-    }
 }
 
 impl Chain {
@@ -391,7 +274,7 @@ async fn new_client(url: Uri) -> Result<ApiClient> {
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let cli = Cli::parse();
+    let cli = cli::Cli::parse();
 
     let rpc_url = cli.rpc;
 
