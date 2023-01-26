@@ -3,7 +3,6 @@ mod cli;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use std::{collections::HashSet, fmt::Debug};
 
 use clap::Parser;
@@ -175,17 +174,9 @@ async fn fetch_storage_pairs(api: &ApiClient, at: &H256) -> Result<StoragePairs>
 
     let mut pairs = FxHashMap::default();
 
-    let mut count = 0;
-    let mut last_update = Instant::now();
     for fut in futs {
         let (k, v) = fut.await??;
-        count += 1;
-        const TICK_INTERVAL: Duration = Duration::from_millis(100);
-        if last_update.elapsed() >= TICK_INTERVAL {
-            bar.inc(count);
-            count = 0;
-            last_update = Instant::now();
-        }
+        bar.inc(1);
         pairs.insert(k, v);
     }
 

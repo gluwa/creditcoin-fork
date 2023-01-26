@@ -82,21 +82,21 @@ impl FromStr for Chain {
     }
 }
 
+fn make_spinner_frame(pos: isize, bounce_width: isize, bar_width: isize) -> String {
+    let mut bounce = String::from("[");
+    for p in 0..bar_width.max(2) - 2 {
+        if p >= pos && p < pos + bounce_width {
+            bounce.push('=');
+        } else {
+            bounce.push(' ');
+        }
+    }
+    bounce.push(']');
+    bounce
+}
+
 fn make_spinner(bounce_width: usize, bar_width: usize) -> Vec<String> {
     let mut steps = Vec::new();
-
-    fn make_bounce_string(pos: isize, bounce_width: isize, bar_width: isize) -> String {
-        let mut bounce = String::from("[");
-        for p in 0..bar_width.max(2) - 2 {
-            if p >= pos && p < pos + bounce_width {
-                bounce.push('=');
-            } else {
-                bounce.push(' ');
-            }
-        }
-        bounce.push(']');
-        bounce
-    }
 
     let bounce_width: isize = bounce_width.try_into().unwrap();
     let bar_width: isize = bar_width.try_into().unwrap();
@@ -104,11 +104,11 @@ fn make_spinner(bounce_width: usize, bar_width: usize) -> Vec<String> {
 
     let mut pos: isize = -bounce_width;
     while pos < bar_content_width {
-        steps.push(make_bounce_string(pos, bounce_width, bar_width));
+        steps.push(make_spinner_frame(pos, bounce_width, bar_width));
         pos += 1;
     }
     while pos > -bounce_width {
-        steps.push(make_bounce_string(pos, bounce_width, bar_width));
+        steps.push(make_spinner_frame(pos, bounce_width, bar_width));
         pos -= 1;
     }
 
@@ -121,6 +121,9 @@ pub struct ProgressBarManager {
     count: u64,
     progress: ProgressBar,
 }
+
+const SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(100);
+const BAR_TICK_INTERVAL: Duration = Duration::from_millis(100);
 
 impl ProgressBarManager {
     pub fn new_spinner(msg: impl Into<Cow<'static, str>>) -> Result<Self> {
@@ -139,8 +142,6 @@ impl ProgressBarManager {
             )
             .with_message(msg);
 
-        const SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(100);
-
         Ok(Self {
             last_update: Instant::now(),
             tick_interval: SPINNER_TICK_INTERVAL,
@@ -157,8 +158,6 @@ impl ProgressBarManager {
                 )?
                 .progress_chars("=> "),
             ).with_message(msg);
-
-        const BAR_TICK_INTERVAL: Duration = Duration::from_millis(100);
 
         Ok(Self {
             last_update: Instant::now(),
