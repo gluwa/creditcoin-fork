@@ -2,14 +2,17 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::{collections::HashSet, fmt::Debug, path::PathBuf, str::FromStr};
 
 use clap::Parser;
 use color_eyre::Result;
 use color_eyre::{eyre::eyre, Report};
+use console::style;
 use extend::ext;
-use futures::{pin_mut, TryStream, TryStreamExt};
+use futures::{TryStream, TryStreamExt};
 use fxhash::FxHashMap;
+use indicatif::ProgressStyle;
 use jsonrpsee::client_transport::ws::{Receiver, Sender, Uri, WsTransportClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -111,13 +114,51 @@ impl<Slice: AsRef<[u8]>> Slice {
     }
 }
 
+fn make_spinner(bounce_width: usize, bar_width: usize) -> Vec<String> {
+    let mut steps = Vec::new();
+
+    fn make_bounce_string(pos: isize, bounce_width: isize, bar_width: isize) -> String {
+        let mut bounce = String::from("[");
+        for p in 0..bar_width.max(2) - 2 {
+            if p >= pos && p < pos + bounce_width {
+                bounce.push('=');
+            } else {
+                bounce.push(' ');
+            }
+        }
+        bounce.push(']');
+        bounce
+    }
+
+    let bounce_width: isize = bounce_width.try_into().unwrap();
+    let bar_width: isize = bar_width.try_into().unwrap();
+    let bar_content_width: isize = bar_width.max(2) - 2;
+
+    let mut pos: isize = -bounce_width;
+    while pos < bar_content_width {
+        steps.push(make_bounce_string(pos, bounce_width, bar_width));
+        pos += 1;
+    }
+    while pos > -bounce_width {
+        steps.push(make_bounce_string(pos, bounce_width, bar_width));
+        pos -= 1;
+    }
+
+    steps
+}
+
 fn key_stream<'a>(
     api: &'a ApiClient,
     at: &'a H256,
     sema: Arc<Semaphore>,
 ) -> impl TryStream<Ok = StorageKey, Error = Report> + 'a {
     Box::pin(async_stream::try_stream! {
+        let sp = make_spinner(10, 40);
+        let sp_slice: Vec<&str> = sp.iter().map(|s| s.as_str()).collect();
         let mut start: Option<StorageKey> = None;
+        let spinner = indicatif::ProgressBar::new_spinner().with_style(ProgressStyle::with_template("{msg:23.green} {spinner} [{elapsed:.cyan}] ({per_sec:>12.magenta})")?.tick_strings(sp_slice.as_slice())).with_message("Fetching storage keys");
+        let mut count: u64 = 0;
+        let mut last_update = Instant::now();
         loop {
             let keys = {
                 let _permit = sema.acquire().await?;
@@ -125,7 +166,15 @@ fn key_stream<'a>(
             };
             start = keys.last().map(|k| k.clone());
             if keys.is_empty() {
+                spinner.finish_with_message("Done");
                 break;
+            }
+            count += u64::try_from(keys.len()).unwrap();
+            const TICK_INTERVAL: Duration = Duration::from_millis(100);
+            if last_update.elapsed() >= TICK_INTERVAL {
+                spinner.inc(count);
+                count = 0;
+                last_update = Instant::now();
             }
             for key in keys {
                 yield key;
@@ -140,14 +189,24 @@ async fn fetch_storage_pairs(api: &ApiClient, at: &H256) -> Result<StoragePairs>
     let sema = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
 
     let keys = key_stream(api, at, sema.clone());
-    pin_mut!(keys);
+    let keys: Vec<_> = keys.try_collect().await?;
+
+    let bar = indicatif::ProgressBar::new(keys.len() as u64)
+        .with_style(
+            ProgressStyle::with_template(
+                "{msg:.green} [{bar:38}] {human_pos:>7.blue}/{human_len:7.blue} [{elapsed:.cyan}] ({per_sec:.magenta})",
+            )?
+            .progress_chars("=> "),
+        )
+        .with_message("Fetching storage values");
 
     let mut futs = Vec::new();
 
-    while let Some(key) = keys.try_next().await? {
+    for key in keys {
         let api = api.clone();
         let at = *at;
         let sema = sema.clone();
+
         futs.push(tokio::spawn(async move {
             let _permit = sema.acquire().await?;
             let value = api
@@ -162,10 +221,23 @@ async fn fetch_storage_pairs(api: &ApiClient, at: &H256) -> Result<StoragePairs>
     }
 
     let mut pairs = FxHashMap::default();
+
+    let mut count = 0;
+    let mut last_update = Instant::now();
     for fut in futs {
         let (k, v) = fut.await??;
+        let bar = bar.clone();
+        count += 1;
+        const TICK_INTERVAL: Duration = Duration::from_millis(100);
+        if last_update.elapsed() >= TICK_INTERVAL {
+            tokio::task::spawn_blocking(move || bar.inc(count));
+            count = 0;
+            last_update = Instant::now();
+        }
         pairs.insert(k, v);
     }
+
+    bar.finish();
 
     Ok(pairs)
 }
@@ -405,9 +477,11 @@ async fn main() -> Result<()> {
         6000u64.encode().to_hex(),
     );
 
+    println!("{}", style("Writing chain specification for fork").green());
+
     tokio::fs::write(cli.out, serde_json::to_vec_pretty(&spec)?).await?;
 
-    println!("Done!");
+    println!("{}", style("Done!").green());
 
     Ok(())
 }
