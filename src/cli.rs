@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    convert::Infallible,
     fmt,
     path::PathBuf,
     str::FromStr,
@@ -12,6 +13,24 @@ use jsonrpsee::client_transport::ws::Uri;
 use sp_core::H256;
 
 use crate::Chain;
+
+#[derive(Clone, Debug)]
+pub enum StorageFile {
+    None,
+    Path(PathBuf),
+}
+
+impl FromStr for StorageFile {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("none") {
+            Ok(StorageFile::None)
+        } else {
+            Ok(StorageFile::Path(PathBuf::from(s)))
+        }
+    }
+}
 
 #[derive(clap::Parser)]
 pub struct Cli {
@@ -41,7 +60,7 @@ pub struct Cli {
     /// state will be fetched from a running node and will not be
     /// saved to a file.
     #[clap(long)]
-    pub storage: Option<PathBuf>,
+    pub storage: Option<StorageFile>,
     /// Block hash to fetch the on-chain state from.
     #[clap(long)]
     pub at: Option<H256>,

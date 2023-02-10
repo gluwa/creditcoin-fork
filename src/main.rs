@@ -23,6 +23,8 @@ use subxt::{OnlineClient, SubstrateConfig};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
+use crate::cli::StorageFile;
+
 pub type ExtrinsicParams = BaseExtrinsicParams<SubstrateConfig, PlainTip>;
 
 pub type CreditcoinConfig = WithExtrinsicParams<SubstrateConfig, ExtrinsicParams>;
@@ -270,15 +272,20 @@ async fn main() -> Result<()> {
     let rpc_url = cli.rpc;
 
     let storage = if let Some(path) = cli.storage {
-        if let Ok(storage) = tokio::fs::read(&path).await {
-            println!("using existing storage");
-            serde_json::from_slice(&storage)?
-        } else {
-            let api = new_client(rpc_url.clone()).await?;
-            let storage = fetch_storage_at(&api, cli.at).await?;
-            let storage_bytes = serde_json::to_vec(&storage)?;
-            tokio::fs::write(&path, storage_bytes).await?;
-            storage
+        match path {
+            StorageFile::None => Default::default(),
+            StorageFile::Path(path) => {
+                if let Ok(storage) = tokio::fs::read(&path).await {
+                    println!("using existing storage");
+                    serde_json::from_slice(&storage)?
+                } else {
+                    let api = new_client(rpc_url.clone()).await?;
+                    let storage = fetch_storage_at(&api, cli.at).await?;
+                    let storage_bytes = serde_json::to_vec(&storage)?;
+                    tokio::fs::write(&path, storage_bytes).await?;
+                    storage
+                }
+            }
         }
     } else {
         let api = new_client(rpc_url.clone()).await?;
@@ -322,6 +329,7 @@ async fn main() -> Result<()> {
     }
 
     let wasm_hex = if let Some(runtime_path) = &cli.runtime {
+        println!("Reading from runtime wasm file: {}", runtime_path.display());
         read_wasm_hex(runtime_path).await?
     } else {
         storage
