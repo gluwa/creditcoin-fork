@@ -1,5 +1,6 @@
 mod cli;
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
@@ -273,7 +274,7 @@ async fn main() -> Result<()> {
 
     let storage = if let Some(path) = cli.storage {
         match path {
-            StorageFile::None => Default::default(),
+            StorageFile::None => HashMap::default(),
             StorageFile::Path(path) => {
                 if let Ok(storage) = tokio::fs::read(&path).await {
                     println!("using existing storage");
