@@ -15,7 +15,7 @@ use fxhash::FxHashMap;
 use jsonrpsee::client_transport::ws::{Receiver, Sender, Uri, WsTransportClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use sp_core::{hashing::twox_128, Encode, H256};
+use sp_core::{hashing::twox_128, H256};
 use subxt::config::WithExtrinsicParams;
 use subxt::storage::StorageKey;
 use subxt::tx::{BaseExtrinsicParams, PlainTip};
