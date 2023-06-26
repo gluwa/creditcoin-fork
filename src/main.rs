@@ -301,9 +301,17 @@ async fn main() -> Result<()> {
     spec.id = cli.id.unwrap_or_else(|| orig_spec.id.joined_with("-fork"));
     spec.protocol_id = orig_spec.protocol_id.clone();
 
-    let exclude: HashSet<&str> = ["System", "Authorship", "Difficulty", "Rewards"]
-        .into_iter()
-        .collect();
+    let exclude: HashSet<&str> = [
+        "System",
+        "Authorship",
+        "Difficulty",
+        "Rewards",
+        "Staking",
+        "Session",
+        "Grandpa",
+    ]
+    .into_iter()
+    .collect();
 
     let mut prefixes = vec![
         storage_prefix("System", "Account"), // System.Account
@@ -354,10 +362,10 @@ async fn main() -> Result<()> {
     );
     spec.boot_nodes = vec![];
 
-    spec.set_state(
-        storage_prefix("Difficulty", "TargetBlockTime"),
-        6000u64.encode().to_hex(),
-    );
+    // spec.set_state(
+    //     storage_prefix("Difficulty", "TargetBlockTime"),
+    //     6000u64.encode().to_hex(),
+    // );
 
     println!("{}", style("Writing chain specification for fork").green());
 
