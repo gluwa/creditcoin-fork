@@ -66,6 +66,8 @@ struct ChainSpec {
     properties: Option<JsonValue>,
     code_substitutes: JsonValue,
     genesis: GenesisState,
+    #[serde(flatten)]
+    extensions: Option<JsonValue>,
 }
 
 #[derive(Deserialize, Serialize)]
