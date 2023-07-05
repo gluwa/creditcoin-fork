@@ -129,9 +129,9 @@ fn key_stream<'a>(
         loop {
             let keys = {
                 let _permit = sema.acquire().await?;
-                api.rpc().storage_keys_paged(&[], 512, start.map(|k| k.0).as_deref(), Some(at.clone())).await.dbg_err()?
+                api.rpc().storage_keys_paged(&[], 512, start.map(|k| k.0).as_deref(), Some(*at)).await.dbg_err()?
             };
-            start = keys.last().map(|k| k.clone());
+            start = keys.last().cloned();
             if keys.is_empty() {
                 spinner.finish_with_message("Done");
                 break;
