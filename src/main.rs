@@ -302,17 +302,26 @@ async fn main() -> Result<()> {
     spec.id = cli.id.unwrap_or_else(|| orig_spec.id.joined_with("-fork"));
     spec.protocol_id = orig_spec.protocol_id.clone();
 
-    let exclude: HashSet<&str> = [
-        "System",
-        "Authorship",
-        "Difficulty",
-        "Rewards",
-        "Staking",
-        "Session",
-        "Grandpa",
-    ]
-    .into_iter()
-    .collect();
+    let mut excludes: HashSet<&str> = if cli.no_default_excludes {
+        HashSet::default()
+    } else {
+        [
+            "System",
+            "Authorship",
+            "Difficulty",
+            "Rewards",
+            "Staking",
+            "Session",
+            "Grandpa",
+            "Babe",
+        ]
+        .into_iter()
+        .collect()
+    };
+
+    if let Some(extra_excludes) = &cli.exclude_pallets {
+        excludes.extend(extra_excludes.iter().map(String::as_str));
+    }
 
     let mut prefixes = vec![
         storage_prefix("System", "Account"), // System.Account
@@ -324,7 +333,7 @@ async fn main() -> Result<()> {
         let meta = api.rpc().metadata().await?;
         for pallet in &meta.runtime_metadata().pallets {
             let n = &pallet.name;
-            if pallet.storage.is_some() && !exclude.contains(n.as_str()) {
+            if pallet.storage.is_some() && !excludes.contains(n.as_str()) {
                 let hashed = module_prefix(n);
                 prefixes.push(hashed);
             }

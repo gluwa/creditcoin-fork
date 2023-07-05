@@ -79,6 +79,16 @@ pub struct Cli {
     /// most pallets with runtime storage will maintain their state
     #[clap(long)]
     pub pallets: Option<Vec<String>>,
+
+    /// A list of additional pallets to exclude state from.
+    /// If you would like to override the default pallets to exclude,
+    /// pass the `--no-default-excludes` flag.
+    #[clap(long)]
+    pub exclude_pallets: Option<Vec<String>>,
+
+    /// If set, will not exclude any pallets by default.
+    #[clap(long)]
+    pub no_default_excludes: bool,
 }
 
 impl fmt::Display for Chain {
