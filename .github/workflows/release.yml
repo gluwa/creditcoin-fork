@@ -14,10 +14,16 @@ jobs:
       with:
         fetch-depth: 0
 
+    - name: Configure rustc version
+      run: |
+        # use the version defined in gluwa/creditcoin3
+        RUSTC_VERSION=$(curl --silent https://raw.githubusercontent.com/gluwa/creditcoin3/dev/rust-toolchain.toml | grep channel | tail -n1 | tr -d " " | cut -f2 -d'"')
+        echo "RUSTC_VERSION=$RUSTC_VERSION" >> "$GITHUB_ENV"
+
     - name: Install Rust toolchain
       uses: actions-rs/toolchain@v1
       with:
-        toolchain: stable
+        toolchain: ${{ env.RUSTC_VERSION }}
         profile: minimal
         override: true
 
