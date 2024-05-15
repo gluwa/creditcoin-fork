@@ -15,21 +15,34 @@ jobs:
     runs-on: ubuntu-20.04
     strategy:
       fail-fast: false
-      matrix:
-        rust: [stable, beta, nightly]
     steps:
       - uses: actions/checkout@v3
+
+      - name: Configure rustc version
+        run: |
+          # use the version defined in gluwa/creditcoin3
+          RUSTC_VERSION=$(curl --silent https://raw.githubusercontent.com/gluwa/creditcoin3/dev/rust-toolchain.toml | grep channel | tail -n1 | tr -d " " | cut -f2 -d'"')
+          echo "RUSTC_VERSION=$RUSTC_VERSION" >> "$GITHUB_ENV"
+
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{matrix.rust}}
+          toolchain: ${{ env.RUSTC_VERSION }}
       - run: cargo check
   fmt:
     name: check formatting
     runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure rustc version
+        run: |
+          # use the version defined in gluwa/creditcoin3
+          RUSTC_VERSION=$(curl --silent https://raw.githubusercontent.com/gluwa/creditcoin3/dev/rust-toolchain.toml | grep channel | tail -n1 | tr -d " " | cut -f2 -d'"')
+          echo "RUSTC_VERSION=$RUSTC_VERSION" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUSTC_VERSION }}
           components: rustfmt
       - run: cargo fmt -- --check
   clippy:
@@ -37,7 +50,15 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure rustc version
+        run: |
+          # use the version defined in gluwa/creditcoin3
+          RUSTC_VERSION=$(curl --silent https://raw.githubusercontent.com/gluwa/creditcoin3/dev/rust-toolchain.toml | grep channel | tail -n1 | tr -d " " | cut -f2 -d'"')
+          echo "RUSTC_VERSION=$RUSTC_VERSION" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUSTC_VERSION }}
           components: clippy
       - run: cargo clippy -- -Dclippy::all -Dclippy::pedantic
