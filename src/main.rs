@@ -16,7 +16,9 @@ use fxhash::FxHashMap;
 use jsonrpsee::client_transport::ws::{Receiver, Sender, Uri, WsTransportClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use sp_core::{hashing::twox_128, H256};
+use sp_core::hashing::{twox_128, twox_64};
+use sp_core::Pair as _;
+use sp_core::H256;
 use subxt::config::WithExtrinsicParams;
 use subxt::storage::StorageKey;
 use subxt::tx::{BaseExtrinsicParams, PlainTip};
@@ -201,6 +203,67 @@ fn module_prefix(module: &str) -> String {
     twox_128(module.as_bytes()).to_hex()
 }
 
+// Well-known dev account seeds (32-byte hex). Account IDs are derived via sr25519.
+const ALICE_SEED_HEX: &str = "0xe5be9a5092b81bca64be81d212e7f2f9eba183bb7a90954f7b76361f6edb5c0a";
+const BOB_SEED_HEX: &str = "0x398f0c28f98885e046333d4a41c19cee4c37368a9832c6502f6cfd182e2aef89";
+
+/// Derive sr25519 account ID (32-byte public key) from a 0x-prefixed 64-char hex seed.
+fn account_id_from_seed_hex(hex: &str) -> Result<[u8; 32], Report> {
+    let s = hex.trim().strip_prefix("0x").unwrap_or(hex).trim();
+    if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(eyre!("seed must be 0x + 64 hex chars, got {}", hex));
+    }
+    let mut seed = [0u8; 32];
+    hex::decode_to_slice(s, &mut seed).map_err(|e| eyre!("invalid hex seed: {e}"))?;
+    let pair = sp_core::sr25519::Pair::from_seed(&seed);
+    Ok(pair.public().0)
+}
+
+/// Attestation pallet: Attestors(chain_key, account_id) for chain key 3.
+/// Storage key = twox_128("Attestation") + twox_128("Attestors") + twox_64_concat(3) + blake2_128_concat(account_id).
+fn attestors_storage_key(account_id: &[u8; 32]) -> String {
+    use blake2::digest::{Update, VariableOutput};
+    let mut key = Vec::with_capacity(32 + 8 + 8 + 16 + 32);
+    key.extend_from_slice(&twox_128(b"Attestation"));
+    key.extend_from_slice(&twox_128(b"Attestors"));
+    let chain_key_3 = 3u64.to_le_bytes();
+    key.extend_from_slice(&twox_64(&chain_key_3));
+    key.extend_from_slice(&chain_key_3);
+    let mut hasher = blake2::Blake2bVar::new(16).unwrap();
+    hasher.update(account_id);
+    let mut hash = [0u8; 16];
+    hasher.finalize_variable(&mut hash).unwrap();
+    key.extend_from_slice(&hash);
+    key.extend_from_slice(account_id);
+    key.to_hex()
+}
+
+/// Attestor value: Option<BlsPublicKey>=None (0x00), AttestorStatus=Idle (0x01), stash=AccountId (32 bytes).
+fn attestor_value_placeholder(account_id: &[u8; 32]) -> String {
+    let mut v = Vec::with_capacity(1 + 1 + 32);
+    v.push(0x00u8); // None for bls_public_key
+    v.push(0x01u8); // AttestorStatus::Idle
+    v.extend_from_slice(account_id);
+    v.to_hex()
+}
+
+/// ActiveAttestors(chain_key) for chain key 3. Key from user.
+const ACTIVE_ATTESTORS_CHAIN_3_KEY: &str =
+    "0x6310fed47319b658f9b8b2504e0d72ec605e795422de90908f14285054a6764b8e79fdf1428e95842eaa9af0b22414be0300000000000000";
+
+/// TargetSampleSize(chain_key) for chain key 3 (Attestation pallet). Key from user.
+const TARGET_SAMPLE_SIZE_CHAIN_3_KEY: &str =
+    "0x6310fed47319b658f9b8b2504e0d72ec77c34a0cad03a52cd52d9faa5a75ec8f8e79fdf1428e95842eaa9af0b22414be0300000000000000";
+
+/// SCALE: Vec<AccountId> with [alice, bob] = compact(2) + 32 + 32.
+fn active_attestors_value(alice: &[u8; 32], bob: &[u8; 32]) -> String {
+    let mut v = Vec::with_capacity(1 + 32 + 32);
+    v.push(0x08u8); // compact encoding of 2
+    v.extend_from_slice(alice);
+    v.extend_from_slice(bob);
+    v.to_hex()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Chain {
     Dev,
@@ -248,8 +311,46 @@ async fn fetch_storage_at(api: &ApiClient, at: Option<H256>) -> Result<StoragePa
     fetch_storage_pairs(api, &at).await
 }
 
+/// Ensures the RPC URL has an explicit port so Uri parsing succeeds (it does not use default ports).
+/// wss://host -> wss://host:443, ws://host -> ws://host:80. Path and query are preserved.
+fn normalize_rpc_url(s: &str) -> String {
+    let s = s.trim();
+    let (scheme, default_port) = if s.starts_with("wss://") {
+        ("wss://", ":443")
+    } else if s.starts_with("ws://") {
+        ("ws://", ":80")
+    } else {
+        return s.to_owned();
+    };
+    let after_scheme = &s[scheme.len()..];
+    let (authority, rest) = match after_scheme.find('/') {
+        Some(i) => (&after_scheme[..i], &after_scheme[i..]),
+        None => {
+            let (auth, q) = match after_scheme.find('?') {
+                Some(i) => (&after_scheme[..i], &after_scheme[i..]),
+                None => (after_scheme, ""),
+            };
+            if auth.contains(':') {
+                return s.to_owned();
+            }
+            return format!("{scheme}{auth}{default_port}{q}");
+        }
+    };
+    if authority.contains(':') {
+        return s.to_owned();
+    }
+    format!("{scheme}{authority}{default_port}{rest}")
+}
+
+fn parse_rpc_uri(s: &str) -> Result<Uri> {
+    let normalized = normalize_rpc_url(s);
+    normalized.parse().err_into()
+}
+
 async fn ws_transport(url: Uri) -> Result<(Sender, Receiver)> {
+    const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     WsTransportClientBuilder::default()
+        .connection_timeout(CONNECTION_TIMEOUT)
         .build(url)
         .await
         .err_into()
@@ -272,7 +373,7 @@ async fn main() -> Result<()> {
 
     let cli = cli::Cli::parse();
 
-    let rpc_url = cli.rpc;
+    let rpc_url = parse_rpc_uri(&cli.rpc)?;
 
     let storage = if let Some(path) = cli.storage {
         match path {
@@ -367,17 +468,60 @@ async fn main() -> Result<()> {
     // Make sure that the genesis state is different
     spec.set_state("0xdeadbeef", "0x1");
 
-    // set the sudo key to Alice
-    spec.set_state(
-        storage_prefix("Sudo", "Key"),
-        "0xd43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d".to_owned(),
-    );
+    if cli.usc {
+        // USC component: derive Alice and Bob from hex seeds; set Sudo key and Attestation pallet genesis
+        let alice = account_id_from_seed_hex(ALICE_SEED_HEX)?;
+        let bob = account_id_from_seed_hex(BOB_SEED_HEX)?;
+
+        spec.set_state(storage_prefix("Sudo", "Key"), alice.to_hex());
+
+        spec.set_state(
+            attestors_storage_key(&alice),
+            attestor_value_placeholder(&alice),
+        );
+        spec.set_state(
+            attestors_storage_key(&bob),
+            attestor_value_placeholder(&bob),
+        );
+        spec.set_state(ACTIVE_ATTESTORS_CHAIN_3_KEY, active_attestors_value(&alice, &bob));
+        spec.set_state(TARGET_SAMPLE_SIZE_CHAIN_3_KEY, "0x02000000");
+    }
+
     spec.boot_nodes = vec![];
 
-    // spec.set_state(
-    //     storage_prefix("Difficulty", "TargetBlockTime"),
-    //     6000u64.encode().to_hex(),
-    // );
+    // Force validator set to dev chain (Alice only) so --alice produces blocks regardless of --base.
+    // Remove any existing consensus/session genesis from the fork, then inject dev's.
+    let validator_pallet_prefixes = [
+        module_prefix("Babe"),
+        module_prefix("Grandpa"),
+        module_prefix("Session"),
+        module_prefix("Staking"),
+        module_prefix("ImOnline"),
+    ];
+    let to_remove: Vec<String> = spec
+        .genesis
+        .raw
+        .top
+        .keys()
+        .filter(|k| {
+            validator_pallet_prefixes
+                .iter()
+                .any(|p| k.starts_with(p.as_str()))
+        })
+        .cloned()
+        .collect();
+    for k in &to_remove {
+        spec.remove_state(k);
+    }
+    let dev_spec = build_spec(&cli.binary, Chain::Dev).await?;
+    for (k, v) in &dev_spec.genesis.raw.top {
+        if validator_pallet_prefixes
+            .iter()
+            .any(|p| k.starts_with(p.as_str()))
+        {
+            spec.set_state(k, v.clone());
+        }
+    }
 
     println!("{}", style("Writing chain specification for fork").green());
 

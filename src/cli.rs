@@ -9,7 +9,6 @@ use std::{
 
 use color_eyre::{Report, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use jsonrpsee::client_transport::ws::Uri;
 use sp_core::H256;
 
 use crate::Chain;
@@ -72,8 +71,9 @@ pub struct Cli {
     pub id: Option<String>,
 
     /// Url for the live node from which to pull state and other required data.
+    /// Port is optional for wss:// (default 443) and ws:// (default 80).
     #[clap(long, default_value = "ws://127.0.0.1:9944")]
-    pub rpc: Uri,
+    pub rpc: String,
 
     /// A list of pallets to keep state from. If omitted,
     /// most pallets with runtime storage will maintain their state
@@ -89,6 +89,12 @@ pub struct Cli {
     /// If set, will not exclude any pallets by default.
     #[clap(long)]
     pub no_default_excludes: bool,
+
+    /// If set, inject USC-related genesis: Sudo key (Alice), Attestation pallet
+    /// (Attestors, ActiveAttestors, TargetSampleSize for chain key 3) derived from
+    /// the configured Alice/Bob hex seeds.
+    #[clap(long)]
+    pub usc: bool,
 }
 
 impl fmt::Display for Chain {
