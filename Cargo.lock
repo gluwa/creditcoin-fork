@@ -528,6 +528,7 @@ name = "creditcoin-fork"
 version = "0.2.0"
 dependencies = [
  "async-stream",
+ "blake2",
  "clap",
  "color-eyre",
  "console",

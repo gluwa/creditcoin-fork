@@ -38,8 +38,9 @@ by running the `creditcoin-fork` binary with the `--help` flag:
 ### Instructions
 
 Run the creditcoin-fork binary. If you're not running a local creditcoin-node
-accessible at `ws://localhost:9944`, make sure to pass the RPC URL of the
-live creditcoin node with the `--rpc` flag.
+accessible at `ws://localhost:9944`, pass the RPC URL with the `--rpc` flag.
+For **public RPC endpoints** you can omit the port—e.g.
+`wss://rpc.usc-devnet.creditcoin.network`—the tool uses 443 for `wss://` and 80 for `ws://` when no port is given.
 
 Minimal example, assuming a live testnet node running on localhost and a `creditcoin-node`
 binary is in your `PATH`:
@@ -53,4 +54,20 @@ You can then run a node on the fork by passing the chain spec path as the `--cha
 
 ```bash
 creditcoin-node --chain ./fork.json --validator --mining-key 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+```
+
+### Single-node fork (producing blocks with `--alice`)
+
+The fork **always** injects the dev chain’s validator genesis (Babe, Grandpa, Session, Staking) so that **Alice** is the sole authority. You can use any `--base` (e.g. `dev` or `devnet`); the fork will overwrite consensus state with the dev chain’s, so running with `--alice` will produce blocks.
+
+Create the fork (example with devnet as source):
+
+```bash
+./target/release/creditcoin-fork --bin creditcoin3-node --orig devnet --base dev --name Development -o fork.json --rpc wss://rpc.usc-devnet.creditcoin.network
+```
+
+Then start the node:
+
+```bash
+creditcoin3-node --chain ./fork.json --validator --alice --pruning archive --base-path ./fork
 ```
