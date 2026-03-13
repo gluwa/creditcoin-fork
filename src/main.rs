@@ -16,7 +16,7 @@ use fxhash::FxHashMap;
 use jsonrpsee::client_transport::ws::{Receiver, Sender, Uri, WsTransportClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use sp_core::hashing::{twox_128, twox_64};
+use sp_core::hashing::twox_128;
 use sp_core::Pair as _;
 use sp_core::H256;
 use subxt::config::WithExtrinsicParams;
@@ -93,6 +93,9 @@ impl ChainSpec {
     }
     fn remove_state(&mut self, key: impl AsRef<str>) {
         self.genesis.raw.top.remove(key.as_ref());
+    }
+    fn remove_keys_with_prefix(&mut self, prefix: &str) {
+        self.genesis.raw.top.retain(|k, _| !k.starts_with(prefix));
     }
 }
 
@@ -203,9 +206,8 @@ fn module_prefix(module: &str) -> String {
     twox_128(module.as_bytes()).to_hex()
 }
 
-// Well-known dev account seeds (32-byte hex). Account IDs are derived via sr25519.
+// Well-known dev account seed (32-byte hex). Account ID is derived via sr25519.
 const ALICE_SEED_HEX: &str = "0xe5be9a5092b81bca64be81d212e7f2f9eba183bb7a90954f7b76361f6edb5c0a";
-const BOB_SEED_HEX: &str = "0x398f0c28f98885e046333d4a41c19cee4c37368a9832c6502f6cfd182e2aef89";
 
 /// Derive sr25519 account ID (32-byte public key) from a 0x-prefixed 64-char hex seed.
 fn account_id_from_seed_hex(hex: &str) -> Result<[u8; 32], Report> {
@@ -219,48 +221,52 @@ fn account_id_from_seed_hex(hex: &str) -> Result<[u8; 32], Report> {
     Ok(pair.public().0)
 }
 
-/// Attestation pallet: Attestors(chain_key, account_id) for chain key 3.
-/// Storage key = twox_128("Attestation") + twox_128("Attestors") + twox_64_concat(3) + blake2_128_concat(account_id).
-fn attestors_storage_key(account_id: &[u8; 32]) -> String {
+fn blake2_128(data: &[u8]) -> [u8; 16] {
     use blake2::digest::{Update, VariableOutput};
-    let mut key = Vec::with_capacity(32 + 8 + 8 + 16 + 32);
-    key.extend_from_slice(&twox_128(b"Attestation"));
-    key.extend_from_slice(&twox_128(b"Attestors"));
-    let chain_key_3 = 3u64.to_le_bytes();
-    key.extend_from_slice(&twox_64(&chain_key_3));
-    key.extend_from_slice(&chain_key_3);
     let mut hasher = blake2::Blake2bVar::new(16).unwrap();
-    hasher.update(account_id);
+    hasher.update(data);
     let mut hash = [0u8; 16];
     hasher.finalize_variable(&mut hash).unwrap();
-    key.extend_from_slice(&hash);
+    hash
+}
+
+/// TargetSampleSize(chain_key) storage key.
+/// StorageMap<_, Blake2_128Concat, ChainKey, ...>
+fn target_sample_size_key(chain_key: u64) -> String {
+    let mut key = Vec::with_capacity(32 + 16 + 8);
+    key.extend_from_slice(&twox_128(b"Attestation"));
+    key.extend_from_slice(&twox_128(b"TargetSampleSize"));
+    let ck = chain_key.to_le_bytes();
+    key.extend_from_slice(&blake2_128(&ck));
+    key.extend_from_slice(&ck);
+    key.to_hex()
+}
+
+/// System.Account storage key (Blake2_128Concat hasher).
+fn system_account_key(account_id: &[u8; 32]) -> String {
+    let mut key = Vec::with_capacity(32 + 16 + 32);
+    key.extend_from_slice(&twox_128(b"System"));
+    key.extend_from_slice(&twox_128(b"Account"));
+    key.extend_from_slice(&blake2_128(account_id));
     key.extend_from_slice(account_id);
     key.to_hex()
 }
 
-/// Attestor value: Option<BlsPublicKey>=None (0x00), AttestorStatus=Idle (0x01), stash=AccountId (32 bytes).
-fn attestor_value_placeholder(account_id: &[u8; 32]) -> String {
-    let mut v = Vec::with_capacity(1 + 1 + 32);
-    v.push(0x00u8); // None for bls_public_key
-    v.push(0x01u8); // AttestorStatus::Idle
-    v.extend_from_slice(account_id);
-    v.to_hex()
-}
+const CTC: u128 = 1_000_000_000_000_000_000;
 
-/// ActiveAttestors(chain_key) for chain key 3. Key from user.
-const ACTIVE_ATTESTORS_CHAIN_3_KEY: &str =
-    "0x6310fed47319b658f9b8b2504e0d72ec605e795422de90908f14285054a6764b8e79fdf1428e95842eaa9af0b22414be0300000000000000";
-
-/// TargetSampleSize(chain_key) for chain key 3 (Attestation pallet). Key from user.
-const TARGET_SAMPLE_SIZE_CHAIN_3_KEY: &str =
-    "0x6310fed47319b658f9b8b2504e0d72ec77c34a0cad03a52cd52d9faa5a75ec8f8e79fdf1428e95842eaa9af0b22414be0300000000000000";
-
-/// SCALE: Vec<AccountId> with [alice, bob] = compact(2) + 32 + 32.
-fn active_attestors_value(alice: &[u8; 32], bob: &[u8; 32]) -> String {
-    let mut v = Vec::with_capacity(1 + 32 + 32);
-    v.push(0x08u8); // compact encoding of 2
-    v.extend_from_slice(alice);
-    v.extend_from_slice(bob);
+/// SCALE-encode an AccountInfo with the given free balance.
+/// Format: nonce(u32) + consumers(u32) + providers(u32) + sufficients(u32)
+///       + free(u128) + reserved(u128) + frozen(u128) + flags(u128)
+fn account_info_value(free: u128) -> String {
+    let mut v = Vec::with_capacity(80);
+    v.extend_from_slice(&0u32.to_le_bytes()); // nonce
+    v.extend_from_slice(&0u32.to_le_bytes()); // consumers
+    v.extend_from_slice(&1u32.to_le_bytes()); // providers (>0 to keep alive)
+    v.extend_from_slice(&0u32.to_le_bytes()); // sufficients
+    v.extend_from_slice(&free.to_le_bytes()); // free balance
+    v.extend_from_slice(&0u128.to_le_bytes()); // reserved
+    v.extend_from_slice(&0u128.to_le_bytes()); // frozen
+    v.extend_from_slice(&(1u128 << 127).to_le_bytes()); // flags (new_logic)
     v.to_hex()
 }
 
@@ -469,56 +475,37 @@ async fn main() -> Result<()> {
     spec.set_state("0xdeadbeef", "0x1");
 
     if cli.usc {
-        // USC component: derive Alice and Bob from hex seeds; set Sudo key and Attestation pallet genesis
         let alice = account_id_from_seed_hex(ALICE_SEED_HEX)?;
-        let bob = account_id_from_seed_hex(BOB_SEED_HEX)?;
-
         spec.set_state(storage_prefix("Sudo", "Key"), alice.to_hex());
 
+        // Fund Alice with 1 million CTC
         spec.set_state(
-            attestors_storage_key(&alice),
-            attestor_value_placeholder(&alice),
+            system_account_key(&alice),
+            account_info_value(1_000_000 * CTC),
         );
-        spec.set_state(
-            attestors_storage_key(&bob),
-            attestor_value_placeholder(&bob),
-        );
-        spec.set_state(ACTIVE_ATTESTORS_CHAIN_3_KEY, active_attestors_value(&alice, &bob));
-        spec.set_state(TARGET_SAMPLE_SIZE_CHAIN_3_KEY, "0x02000000");
+
+        // Clear all Attestors, ActiveAttestors, and TargetSampleSize entries
+        spec.remove_keys_with_prefix(&storage_prefix("Attestation", "Attestors"));
+        spec.remove_keys_with_prefix(&storage_prefix("Attestation", "ActiveAttestors"));
+        spec.remove_keys_with_prefix(&storage_prefix("Attestation", "TargetSampleSize"));
+
+        // Clear Randomness pallet so it regenerates from fresh epochs
+        spec.remove_keys_with_prefix(&module_prefix("Randomness"));
+
+        spec.set_state(target_sample_size_key(1), "0x03000000");
     }
 
     spec.boot_nodes = vec![];
 
     // Force validator set to dev chain (Alice only) so --alice produces blocks regardless of --base.
-    // Remove any existing consensus/session genesis from the fork, then inject dev's.
-    let validator_pallet_prefixes = [
-        module_prefix("Babe"),
-        module_prefix("Grandpa"),
-        module_prefix("Session"),
-        module_prefix("Staking"),
-        module_prefix("ImOnline"),
-    ];
-    let to_remove: Vec<String> = spec
-        .genesis
-        .raw
-        .top
-        .keys()
-        .filter(|k| {
-            validator_pallet_prefixes
-                .iter()
-                .any(|p| k.starts_with(p.as_str()))
-        })
-        .cloned()
-        .collect();
-    for k in &to_remove {
-        spec.remove_state(k);
+    let validator_pallets = ["Babe", "Grandpa", "Session", "Staking", "ImOnline", "VoterList"];
+    for pallet in &validator_pallets {
+        spec.remove_keys_with_prefix(&module_prefix(pallet));
     }
     let dev_spec = build_spec(&cli.binary, Chain::Dev).await?;
+    let validator_prefixes: Vec<_> = validator_pallets.iter().map(|p| module_prefix(p)).collect();
     for (k, v) in &dev_spec.genesis.raw.top {
-        if validator_pallet_prefixes
-            .iter()
-            .any(|p| k.starts_with(p.as_str()))
-        {
+        if validator_prefixes.iter().any(|p| k.starts_with(p.as_str())) {
             spec.set_state(k, v.clone());
         }
     }
