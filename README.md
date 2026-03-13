@@ -71,3 +71,33 @@ Then start the node:
 ```bash
 creditcoin3-node --chain ./fork.json --validator --alice --pruning archive --base-path ./fork
 ```
+
+### Custom runtime (`--runtime`)
+
+By default the fork uses the runtime WASM blob fetched from the live chain. If you want to use a custom runtime, for example one with shorter epoch/era durations for faster testing—build your runtime and pass it with `--runtime`:
+
+```bash
+# Build the runtime (from the creditcoin3-next repo)
+cargo build --release -p creditcoin3-runtime
+
+# Create the fork with the custom runtime
+./target/release/creditcoin-fork \
+  --bin creditcoin3-node \
+  --orig testnet --base testnet --name Testnet \
+  -o fork.json \
+  --rpc wss://rpc.usc-testnet2.creditcoin.network \
+  --usc \
+  --runtime /path/to/creditcoin3-next/target/release/wbuild/creditcoin3-runtime/creditcoin3_runtime.compact.compressed.wasm
+```
+
+To shorten epoch/era durations, edit `runtime/src/lib.rs` in the creditcoin3-next repo before building:
+
+```rust
+// Change epoch from 12 hours to 15 minutes:
+pub const EPOCH_DURATION_IN_BLOCKS: u32 = prod_or_fast!(15 * MINUTES, BLOCKS_FOR_FASTER_EPOCH);
+//                                                       ^^^^^^^^^^^^
+//                                            was: 12 * HOURS (2,880 blocks / 12 hrs)
+//                                            now: 15 * MINUTES (60 blocks / 15 min)
+```
+
+`SessionsPerEra` is 2 by default, so era duration = 2 × epoch. With the change above, eras go from 24 hours to 30 minutes.
