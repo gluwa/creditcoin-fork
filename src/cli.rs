@@ -91,8 +91,8 @@ pub struct Cli {
     pub no_default_excludes: bool,
 
     /// If set, inject USC-related genesis: set Sudo key to Alice, fund Alice
-    /// with 1M CTC, clear Attestation pallet state (Attestors, ActiveAttestors,
-    /// Randomness), and set TargetSampleSize to 3 for chain key 1.
+    /// with 1M CTC, clear Attestation pallet state (Attestors, `ActiveAttestors`,
+    /// Randomness), and set `TargetSampleSize` to 3 for chain key 1.
     #[clap(long)]
     pub usc: bool,
 }
