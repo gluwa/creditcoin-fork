@@ -230,8 +230,7 @@ fn blake2_128(data: &[u8]) -> [u8; 16] {
     hash
 }
 
-/// TargetSampleSize(chain_key) storage key.
-/// StorageMap<_, Blake2_128Concat, ChainKey, ...>
+/// `TargetSampleSize(chain_key)` storage key.
 fn target_sample_size_key(chain_key: u64) -> String {
     let mut key = Vec::with_capacity(32 + 16 + 8);
     key.extend_from_slice(&twox_128(b"Attestation"));
@@ -242,7 +241,7 @@ fn target_sample_size_key(chain_key: u64) -> String {
     key.to_hex()
 }
 
-/// System.Account storage key (Blake2_128Concat hasher).
+/// `System.Account` storage key (`Blake2_128Concat` hasher).
 fn system_account_key(account_id: &[u8; 32]) -> String {
     let mut key = Vec::with_capacity(32 + 16 + 32);
     key.extend_from_slice(&twox_128(b"System"));
@@ -254,7 +253,7 @@ fn system_account_key(account_id: &[u8; 32]) -> String {
 
 const CTC: u128 = 1_000_000_000_000_000_000;
 
-/// SCALE-encode an AccountInfo with the given free balance.
+/// SCALE-encode an `AccountInfo` with the given free balance.
 /// Format: nonce(u32) + consumers(u32) + providers(u32) + sufficients(u32)
 ///       + free(u128) + reserved(u128) + frozen(u128) + flags(u128)
 fn account_info_value(free: u128) -> String {
@@ -318,7 +317,7 @@ async fn fetch_storage_at(api: &ApiClient, at: Option<H256>) -> Result<StoragePa
 }
 
 /// Ensures the RPC URL has an explicit port so Uri parsing succeeds (it does not use default ports).
-/// wss://host -> wss://host:443, ws://host -> ws://host:80. Path and query are preserved.
+/// `wss://host` -> `wss://host:443`, `ws://host` -> `ws://host:80`. Path and query are preserved.
 fn normalize_rpc_url(s: &str) -> String {
     let s = s.trim();
     let (scheme, default_port) = if s.starts_with("wss://") {
@@ -329,18 +328,17 @@ fn normalize_rpc_url(s: &str) -> String {
         return s.to_owned();
     };
     let after_scheme = &s[scheme.len()..];
-    let (authority, rest) = match after_scheme.find('/') {
-        Some(i) => (&after_scheme[..i], &after_scheme[i..]),
-        None => {
-            let (auth, q) = match after_scheme.find('?') {
-                Some(i) => (&after_scheme[..i], &after_scheme[i..]),
-                None => (after_scheme, ""),
-            };
-            if auth.contains(':') {
-                return s.to_owned();
-            }
-            return format!("{scheme}{auth}{default_port}{q}");
+    let (authority, rest) = if let Some(i) = after_scheme.find('/') {
+        (&after_scheme[..i], &after_scheme[i..])
+    } else {
+        let (auth, q) = match after_scheme.find('?') {
+            Some(i) => (&after_scheme[..i], &after_scheme[i..]),
+            None => (after_scheme, ""),
+        };
+        if auth.contains(':') {
+            return s.to_owned();
         }
+        return format!("{scheme}{auth}{default_port}{q}");
     };
     if authority.contains(':') {
         return s.to_owned();
@@ -371,6 +369,46 @@ async fn new_client(url: Uri) -> Result<ApiClient> {
     );
     let api = ApiClient::from_rpc_client(client).await?;
     Ok(api)
+}
+
+fn apply_usc_genesis(spec: &mut ChainSpec) -> Result<()> {
+    let alice = account_id_from_seed_hex(ALICE_SEED_HEX)?;
+    spec.set_state(storage_prefix("Sudo", "Key"), alice.to_hex());
+
+    spec.set_state(
+        system_account_key(&alice),
+        account_info_value(1_000_000 * CTC),
+    );
+
+    spec.remove_keys_with_prefix(&storage_prefix("Attestation", "Attestors"));
+    spec.remove_keys_with_prefix(&storage_prefix("Attestation", "ActiveAttestors"));
+    spec.remove_keys_with_prefix(&storage_prefix("Attestation", "TargetSampleSize"));
+    spec.remove_keys_with_prefix(&module_prefix("Randomness"));
+
+    spec.set_state(target_sample_size_key(1), "0x03000000");
+    Ok(())
+}
+
+async fn inject_dev_validators(spec: &mut ChainSpec, binary: &Path) -> Result<()> {
+    let validator_pallets = [
+        "Babe",
+        "Grandpa",
+        "Session",
+        "Staking",
+        "ImOnline",
+        "VoterList",
+    ];
+    for pallet in &validator_pallets {
+        spec.remove_keys_with_prefix(&module_prefix(pallet));
+    }
+    let dev_spec = build_spec(binary, Chain::Dev).await?;
+    let prefixes: Vec<_> = validator_pallets.iter().map(|p| module_prefix(p)).collect();
+    for (k, v) in &dev_spec.genesis.raw.top {
+        if prefixes.iter().any(|p| k.starts_with(p.as_str())) {
+            spec.set_state(k, v.clone());
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -475,40 +513,11 @@ async fn main() -> Result<()> {
     spec.set_state("0xdeadbeef", "0x1");
 
     if cli.usc {
-        let alice = account_id_from_seed_hex(ALICE_SEED_HEX)?;
-        spec.set_state(storage_prefix("Sudo", "Key"), alice.to_hex());
-
-        // Fund Alice with 1 million CTC
-        spec.set_state(
-            system_account_key(&alice),
-            account_info_value(1_000_000 * CTC),
-        );
-
-        // Clear all Attestors, ActiveAttestors, and TargetSampleSize entries
-        spec.remove_keys_with_prefix(&storage_prefix("Attestation", "Attestors"));
-        spec.remove_keys_with_prefix(&storage_prefix("Attestation", "ActiveAttestors"));
-        spec.remove_keys_with_prefix(&storage_prefix("Attestation", "TargetSampleSize"));
-
-        // Clear Randomness pallet so it regenerates from fresh epochs
-        spec.remove_keys_with_prefix(&module_prefix("Randomness"));
-
-        spec.set_state(target_sample_size_key(1), "0x03000000");
+        apply_usc_genesis(&mut spec)?;
     }
 
     spec.boot_nodes = vec![];
-
-    // Force validator set to dev chain (Alice only) so --alice produces blocks regardless of --base.
-    let validator_pallets = ["Babe", "Grandpa", "Session", "Staking", "ImOnline", "VoterList"];
-    for pallet in &validator_pallets {
-        spec.remove_keys_with_prefix(&module_prefix(pallet));
-    }
-    let dev_spec = build_spec(&cli.binary, Chain::Dev).await?;
-    let validator_prefixes: Vec<_> = validator_pallets.iter().map(|p| module_prefix(p)).collect();
-    for (k, v) in &dev_spec.genesis.raw.top {
-        if validator_prefixes.iter().any(|p| k.starts_with(p.as_str())) {
-            spec.set_state(k, v.clone());
-        }
-    }
+    inject_dev_validators(&mut spec, &cli.binary).await?;
 
     println!("{}", style("Writing chain specification for fork").green());
 
