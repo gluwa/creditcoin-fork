@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::{collections::HashSet, fmt::Debug};
 
+use bls_signatures::{PrivateKey as BlsPrivateKey, Serialize as BlsSerialize};
 use clap::Parser;
 use color_eyre::Result;
 use color_eyre::{eyre::eyre, Report};
@@ -16,7 +17,7 @@ use fxhash::FxHashMap;
 use jsonrpsee::client_transport::ws::{Receiver, Sender, Uri, WsTransportClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use sp_core::hashing::twox_128;
+use sp_core::hashing::{blake2_128, twox_128, twox_64};
 use sp_core::Pair as _;
 use sp_core::H256;
 use subxt::config::WithExtrinsicParams;
@@ -206,8 +207,9 @@ fn module_prefix(module: &str) -> String {
     twox_128(module.as_bytes()).to_hex()
 }
 
-// Well-known dev account seed (32-byte hex). Account ID is derived via sr25519.
+// Well-known dev account seeds (32-byte hex). Account IDs are derived via sr25519.
 const ALICE_SEED_HEX: &str = "0xe5be9a5092b81bca64be81d212e7f2f9eba183bb7a90954f7b76361f6edb5c0a";
+const BOB_SEED_HEX: &str = "0x398f0c28f98885e046333d4a41c19cee4c37368a9832c6502f6cfd182e2aef89";
 
 /// Derive sr25519 account ID (32-byte public key) from a 0x-prefixed 64-char hex seed.
 fn account_id_from_seed_hex(hex: &str) -> Result<[u8; 32], Report> {
@@ -221,52 +223,158 @@ fn account_id_from_seed_hex(hex: &str) -> Result<[u8; 32], Report> {
     Ok(pair.public().0)
 }
 
-fn blake2_128(data: &[u8]) -> [u8; 16] {
-    use blake2::digest::{Update, VariableOutput};
-    let mut hasher = blake2::Blake2bVar::new(16).unwrap();
-    hasher.update(data);
-    let mut hash = [0u8; 16];
-    hasher.finalize_variable(&mut hash).unwrap();
-    hash
+fn append_twox_64_concat_u64(key: &mut Vec<u8>, chain_key: u64) {
+    let le = chain_key.to_le_bytes();
+    key.extend_from_slice(&twox_64(&le));
+    key.extend_from_slice(&le);
 }
 
-/// `TargetSampleSize(chain_key)` storage key.
-fn target_sample_size_key(chain_key: u64) -> String {
-    let mut key = Vec::with_capacity(32 + 16 + 8);
+/// Substrate `Blake2_128Concat`: `blake2_128(data) || data`.
+fn append_blake2_128_concat_bytes(key: &mut Vec<u8>, data: &[u8]) {
+    key.extend_from_slice(&blake2_128(data));
+    key.extend_from_slice(data);
+}
+
+/// Blake2_128Concat for SCALE-encoded `u64` chain key (maps that use `Blake2_128Concat, ChainKey`).
+fn append_blake2_128_concat_u64(key: &mut Vec<u8>, chain_key: u64) {
+    let encoded = chain_key.to_le_bytes();
+    append_blake2_128_concat_bytes(key, &encoded);
+}
+
+/// Prefix shared by every `Attestation::Attestors(chain_key, _)` key for a fixed `chain_key`.
+fn attestors_storage_key_prefix(chain_key: u64) -> String {
+    let mut key = Vec::with_capacity(48);
     key.extend_from_slice(&twox_128(b"Attestation"));
-    key.extend_from_slice(&twox_128(b"TargetSampleSize"));
-    let ck = chain_key.to_le_bytes();
-    key.extend_from_slice(&blake2_128(&ck));
-    key.extend_from_slice(&ck);
+    key.extend_from_slice(&twox_128(b"Attestors"));
+    append_twox_64_concat_u64(&mut key, chain_key);
     key.to_hex()
 }
 
-/// `System.Account` storage key (`Blake2_128Concat` hasher).
-fn system_account_key(account_id: &[u8; 32]) -> String {
-    let mut key = Vec::with_capacity(32 + 16 + 32);
-    key.extend_from_slice(&twox_128(b"System"));
-    key.extend_from_slice(&twox_128(b"Account"));
-    key.extend_from_slice(&blake2_128(account_id));
+/// Attestation pallet: Attestors(chain_key, account_id).
+/// Storage key = twox_128("Attestation") + twox_128("Attestors") + twox_64_concat(chain_key) + blake2_128_concat(account_id).
+fn attestors_storage_key(account_id: &[u8; 32], chain_key: u64) -> String {
+    use blake2::digest::{Update, VariableOutput};
+    let mut key = Vec::with_capacity(32 + 8 + 8 + 16 + 32);
+    key.extend_from_slice(&twox_128(b"Attestation"));
+    key.extend_from_slice(&twox_128(b"Attestors"));
+    append_twox_64_concat_u64(&mut key, chain_key);
+    let mut hasher = blake2::Blake2bVar::new(16).unwrap();
+    hasher.update(account_id);
+    let mut hash = [0u8; 16];
+    hasher.finalize_variable(&mut hash).unwrap();
+    key.extend_from_slice(&hash);
     key.extend_from_slice(account_id);
     key.to_hex()
 }
 
-const CTC: u128 = 1_000_000_000_000_000_000;
+/// BLS public key (48 bytes) from the same derivation as `attestor`: `PrivateKey::new` over the
+/// UTF-8 bytes of the secret URI string (`0x` + 64 hex for raw seeds).
+fn bls_public_key_from_hex_seed_uri(seed_hex_uri: &str) -> Result<[u8; 48], Report> {
+    let pk = BlsPrivateKey::new(seed_hex_uri.as_bytes()).public_key();
+    let bytes = BlsSerialize::as_bytes(&pk);
+    bytes
+        .try_into()
+        .map_err(|_| eyre!("BLS public key must be 48 bytes"))
+}
 
-/// SCALE-encode an `AccountInfo` with the given free balance.
-/// Format: nonce(u32) + consumers(u32) + providers(u32) + sufficients(u32)
-///       + free(u128) + reserved(u128) + frozen(u128) + flags(u128)
-fn account_info_value(free: u128) -> String {
+/// `Attestor` SCALE value: `Some(bls)`, `AttestorStatus::Active`, stash.
+fn attestor_value_with_bls(bls_public_key: &[u8; 48], stash: &[u8; 32]) -> String {
+    let mut v = Vec::with_capacity(1 + 48 + 1 + 32);
+    v.push(0x01u8); // Option::Some
+    v.extend_from_slice(bls_public_key);
+    v.push(0x00u8); // AttestorStatus::Active (first variant)
+    v.extend_from_slice(stash);
+    v.to_hex()
+}
+
+/// ActiveAttestors(chain_key): twox_128 + twox_128 + blake2_128_concat(SCALE u64).
+fn active_attestors_storage_key(chain_key: u64) -> String {
+    let mut key = Vec::with_capacity(16 + 16 + 16 + 8);
+    key.extend_from_slice(&twox_128(b"Attestation"));
+    key.extend_from_slice(&twox_128(b"ActiveAttestors"));
+    append_blake2_128_concat_u64(&mut key, chain_key);
+    key.to_hex()
+}
+
+/// TargetSampleSize(chain_key): twox_128 + twox_128 + blake2_128_concat(SCALE u64).
+fn target_sample_size_storage_key(chain_key: u64) -> String {
+    let mut key = Vec::with_capacity(16 + 16 + 16 + 8);
+    key.extend_from_slice(&twox_128(b"Attestation"));
+    key.extend_from_slice(&twox_128(b"TargetSampleSize"));
+    append_blake2_128_concat_u64(&mut key, chain_key);
+    key.to_hex()
+}
+
+/// SCALE: Vec<AccountId> with [alice, bob] = compact(2) + 32 + 32.
+fn active_attestors_value(alice: &[u8; 32], bob: &[u8; 32]) -> String {
+    let mut v = Vec::with_capacity(1 + 32 + 32);
+    v.push(0x08u8); // compact encoding of 2
+    v.extend_from_slice(alice);
+    v.extend_from_slice(bob);
+    v.to_hex()
+}
+
+/// `System.Account(AccountId)`: twox_128 + twox_128 + blake2_128_concat(AccountId bytes).
+fn system_account_storage_key(account_id: &[u8; 32]) -> String {
+    let mut key = Vec::with_capacity(16 + 16 + 16 + 32);
+    key.extend_from_slice(&twox_128(b"System"));
+    key.extend_from_slice(&twox_128(b"Account"));
+    append_blake2_128_concat_bytes(&mut key, account_id.as_slice());
+    key.to_hex()
+}
+
+/// 10 CTC in planck (1 CTC = 1e18 planck; matches node `chain_spec` `UNITS`).
+const TEN_CTC_PLANCK: u128 = 10 * 1_000_000_000_000_000_000;
+
+/// `pallet_balances::ExtraFlags::default()` — new balance ref-counting is active.
+const BALANCE_EXTRA_FLAGS: u128 = 0x80000000_00000000_00000000_00000000u128;
+
+/// `frame_system::AccountInfo` + `pallet_balances::AccountData` SCALE encoding (nonce, refcounts, free/reserved/frozen/flags).
+fn system_account_info_with_free_balance(free: u128) -> String {
     let mut v = Vec::with_capacity(80);
     v.extend_from_slice(&0u32.to_le_bytes()); // nonce
     v.extend_from_slice(&0u32.to_le_bytes()); // consumers
-    v.extend_from_slice(&1u32.to_le_bytes()); // providers (>0 to keep alive)
+    v.extend_from_slice(&1u32.to_le_bytes()); // providers (balances pallet)
     v.extend_from_slice(&0u32.to_le_bytes()); // sufficients
-    v.extend_from_slice(&free.to_le_bytes()); // free balance
+    v.extend_from_slice(&free.to_le_bytes());
     v.extend_from_slice(&0u128.to_le_bytes()); // reserved
     v.extend_from_slice(&0u128.to_le_bytes()); // frozen
-    v.extend_from_slice(&(1u128 << 127).to_le_bytes()); // flags (new_logic)
+    v.extend_from_slice(&BALANCE_EXTRA_FLAGS.to_le_bytes());
     v.to_hex()
+}
+
+fn json_hex_bytes(v: &JsonValue) -> Option<Vec<u8>> {
+    let s = v.as_str()?;
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    hex::decode(s).ok()
+}
+
+fn u128_le_from_first_16(bytes: &[u8]) -> Option<u128> {
+    if bytes.len() < 16 {
+        return None;
+    }
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(&bytes[..16]);
+    Some(u128::from_le_bytes(arr))
+}
+
+/// `free` field inside `AccountInfo` (offset 16: after nonce + 3× RefCount).
+fn free_balance_from_account_storage(bytes: &[u8]) -> Option<u128> {
+    if bytes.len() < 32 {
+        return None;
+    }
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(&bytes[16..32]);
+    Some(u128::from_le_bytes(arr))
+}
+
+fn free_balance_from_account_json(v: &JsonValue) -> Option<u128> {
+    let b = json_hex_bytes(v)?;
+    free_balance_from_account_storage(&b)
+}
+
+fn scale_u128_storage_hex(n: u128) -> String {
+    n.to_le_bytes().to_hex()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -369,24 +477,6 @@ async fn new_client(url: Uri) -> Result<ApiClient> {
     );
     let api = ApiClient::from_rpc_client(client).await?;
     Ok(api)
-}
-
-fn apply_usc_genesis(spec: &mut ChainSpec) -> Result<()> {
-    let alice = account_id_from_seed_hex(ALICE_SEED_HEX)?;
-    spec.set_state(storage_prefix("Sudo", "Key"), alice.to_hex());
-
-    spec.set_state(
-        system_account_key(&alice),
-        account_info_value(1_000_000 * CTC),
-    );
-
-    spec.remove_keys_with_prefix(&storage_prefix("Attestation", "Attestors"));
-    spec.remove_keys_with_prefix(&storage_prefix("Attestation", "ActiveAttestors"));
-    spec.remove_keys_with_prefix(&storage_prefix("Attestation", "TargetSampleSize"));
-    spec.remove_keys_with_prefix(&module_prefix("Randomness"));
-
-    spec.set_state(target_sample_size_key(1), "0x03000000");
-    Ok(())
 }
 
 async fn inject_dev_validators(spec: &mut ChainSpec, binary: &Path) -> Result<()> {
@@ -513,7 +603,91 @@ async fn main() -> Result<()> {
     spec.set_state("0xdeadbeef", "0x1");
 
     if cli.usc {
-        apply_usc_genesis(&mut spec)?;
+        // USC component: derive Alice and Bob from hex seeds; set Sudo key and Attestation pallet genesis
+        let ck = cli.usc_chain_key;
+        let alice = account_id_from_seed_hex(ALICE_SEED_HEX)?;
+        let bob = account_id_from_seed_hex(BOB_SEED_HEX)?;
+
+        spec.set_state(storage_prefix("Sudo", "Key"), alice.to_hex());
+
+        spec.remove_keys_with_prefix(&storage_prefix("Attestation", "ActiveAttestors"));
+        spec.remove_keys_with_prefix(&storage_prefix("Attestation", "TargetSampleSize"));
+        spec.remove_keys_with_prefix(&module_prefix("Randomness"));
+
+        // Merged RPC state includes every on-chain `Attestors` entry; drop them so only Alice/Bob remain.
+        let attestors_prefix = attestors_storage_key_prefix(ck);
+        let attestors_keys_to_clear: Vec<String> = spec
+            .genesis
+            .raw
+            .top
+            .keys()
+            .filter(|k| k.starts_with(attestors_prefix.as_str()))
+            .cloned()
+            .collect();
+        for k in attestors_keys_to_clear {
+            spec.remove_state(&k);
+        }
+
+        let alice_bls = bls_public_key_from_hex_seed_uri(ALICE_SEED_HEX)?;
+        let bob_bls = bls_public_key_from_hex_seed_uri(BOB_SEED_HEX)?;
+
+        spec.set_state(
+            attestors_storage_key(&alice, ck),
+            attestor_value_with_bls(&alice_bls, &alice),
+        );
+        spec.set_state(
+            attestors_storage_key(&bob, ck),
+            attestor_value_with_bls(&bob_bls, &bob),
+        );
+        spec.set_state(
+            active_attestors_storage_key(ck),
+            active_attestors_value(&alice, &bob),
+        );
+        spec.set_state(target_sample_size_storage_key(ck), "0x02000000");
+
+        // 10 CTC each on `System.Account`; keep `Balances::TotalIssuance` consistent with prior state.
+        let issuance_key = storage_prefix("Balances", "TotalIssuance");
+        let old_issuance = spec
+            .genesis
+            .raw
+            .top
+            .get(&issuance_key)
+            .and_then(json_hex_bytes)
+            .and_then(|b| u128_le_from_first_16(&b))
+            .unwrap_or(0);
+
+        let alice_acct_key = system_account_storage_key(&alice);
+        let bob_acct_key = system_account_storage_key(&bob);
+        let old_alice_free = spec
+            .genesis
+            .raw
+            .top
+            .get(&alice_acct_key)
+            .and_then(free_balance_from_account_json)
+            .unwrap_or(0);
+        let old_bob_free = spec
+            .genesis
+            .raw
+            .top
+            .get(&bob_acct_key)
+            .and_then(free_balance_from_account_json)
+            .unwrap_or(0);
+
+        let new_issuance = old_issuance
+            .saturating_sub(old_alice_free)
+            .saturating_sub(old_bob_free)
+            .saturating_add(TEN_CTC_PLANCK)
+            .saturating_add(TEN_CTC_PLANCK);
+
+        spec.set_state(
+            alice_acct_key,
+            system_account_info_with_free_balance(TEN_CTC_PLANCK),
+        );
+        spec.set_state(
+            bob_acct_key,
+            system_account_info_with_free_balance(TEN_CTC_PLANCK),
+        );
+        spec.set_state(issuance_key, scale_u128_storage_hex(new_issuance));
     }
 
     spec.boot_nodes = vec![];
@@ -526,4 +700,30 @@ async fn main() -> Result<()> {
     println!("{}", style("Done!").green());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod usc_storage_key_tests {
+    use super::*;
+
+    #[test]
+    fn chain_3_keys_match_prior_hardcoded_constants() {
+        assert_eq!(
+            active_attestors_storage_key(3),
+            "0x6310fed47319b658f9b8b2504e0d72ec605e795422de90908f14285054a6764b8e79fdf1428e95842eaa9af0b22414be0300000000000000"
+        );
+        assert_eq!(
+            target_sample_size_storage_key(3),
+            "0x6310fed47319b658f9b8b2504e0d72ec77c34a0cad03a52cd52d9faa5a75ec8f8e79fdf1428e95842eaa9af0b22414be0300000000000000"
+        );
+    }
+
+    #[test]
+    fn attestors_storage_key_starts_with_chain_prefix() {
+        let alice = account_id_from_seed_hex(ALICE_SEED_HEX).unwrap();
+        let ck = 3u64;
+        let prefix = attestors_storage_key_prefix(ck);
+        let key = attestors_storage_key(&alice, ck);
+        assert!(key.starts_with(&prefix), "{key} should start with {prefix}");
+    }
 }
