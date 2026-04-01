@@ -8,6 +8,9 @@ edition = "2021"
 [dependencies]
 async-stream = "0.3.3"
 blake2 = "0.10"
+bls-signatures = { git = "https://github.com/gluwa/bls-signatures", tag = "v0.15.0", default-features = false, features = [
+    "pairing",
+] }
 clap = { version = "4.0.32", features = ["derive"] }
 color-eyre = "0.6.2"
 console = "0.15.5"
