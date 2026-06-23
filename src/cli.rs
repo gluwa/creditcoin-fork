@@ -54,10 +54,10 @@ pub struct Cli {
     pub base_chain: Chain,
     /// Path to the cached runtime storage file. If passed
     /// and the file does not exist, the chain's state will
-    /// be fetched and written to the given path. If the file
+    /// be fetched and streamed to the given path. If the file
     /// does exist, the state in the file will be used. If omitted,
-    /// state will be fetched from a running node and will not be
-    /// saved to a file.
+    /// state is cached at `<out>.storage.json` (and reused if present).
+    /// Pass `none` to skip fetching state entirely.
     #[clap(long)]
     pub storage: Option<StorageFile>,
     /// Block hash to fetch the on-chain state from.
@@ -74,6 +74,33 @@ pub struct Cli {
     /// Port is optional for wss:// (default 443) and ws:// (default 80).
     #[clap(long, default_value = "ws://127.0.0.1:9944")]
     pub rpc: String,
+
+    /// HTTP(S) JSON-RPC endpoint for bulk state fetching. Defaults to the
+    /// `--rpc` URL with `wss://` swapped for `https://` (public endpoints
+    /// serve both, and HTTP requests load-balance across backends, which is
+    /// much faster than a single pinned websocket session). Pass `none` to
+    /// fetch over the websocket connection instead.
+    #[clap(long)]
+    pub http_rpc: Option<String>,
+
+    /// Number of websocket connections to spread state-fetch requests over
+    /// when fetching over websocket (`--http-rpc none`). Raising this only
+    /// helps if the RPC endpoint rate-limits per connection rather than per
+    /// client IP.
+    #[clap(long, default_value_t = 1)]
+    pub rpc_connections: usize,
+
+    /// Keys per `state_queryStorageAt` batch request when fetching values.
+    /// Larger batches use a per-IP request budget more efficiently but produce
+    /// bigger responses.
+    #[clap(long, default_value_t = 1000)]
+    pub value_batch_size: usize,
+
+    /// Number of keyspace ranges scanned concurrently when listing storage
+    /// keys. Past ~32 the bottleneck is usually the node's own trie iteration
+    /// speed, not concurrency.
+    #[clap(long, default_value_t = 64)]
+    pub key_scan_concurrency: usize,
 
     /// A list of pallets to keep state from. If omitted,
     /// most pallets with runtime storage will maintain their state

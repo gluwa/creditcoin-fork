@@ -50,6 +50,22 @@ binary is in your `PATH`:
 ```
 
 This should run successfully and the fork's chain spec will be located at `fork.json`.
+
+The fetched chain state is streamed to a storage cache file on disk (`--storage <path>`,
+defaulting to `<out>.storage.json`) rather than held in memory, so forking large chains
+(e.g. mainnet) works on machines with modest RAM. If the cache file already exists it is
+reused instead of refetching — delete it (or pass a different `--storage` path) to fetch
+fresh state.
+
+State fetching is tuned for public load-balanced endpoints: for `wss://` URLs the bulk
+fetch goes over HTTPS by default (stateless requests load-balance across backends,
+unlike a pinned websocket session — override with `--http-rpc <url|none>`), storage keys
+are listed with dynamically splitting parallel range scans (`--key-scan-concurrency`),
+and values are fetched in batches via `state_queryStorageAt`
+(`--value-batch-size`, with automatic per-key fallback). Note that on large chains the
+practical ceiling is usually the node's own trie iteration speed over the biggest
+storage maps, not the client or network.
+
 You can then run a node on the fork by passing the chain spec path as the `--chain`, for example:
 
 ```bash
