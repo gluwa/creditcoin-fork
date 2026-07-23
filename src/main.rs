@@ -592,6 +592,50 @@ fn read_selected_keys(path: &Path, wanted: &HashSet<String>) -> Result<HashMap<S
     SelectedKeys { wanted }.deserialize(&mut de).err_into()
 }
 
+/// Stream-deserialize the storage file, collecting the keys that start with `prefix`.
+struct KeysWithPrefix<'a> {
+    prefix: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for KeysWithPrefix<'_> {
+    type Value = Vec<String>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for KeysWithPrefix<'_> {
+    type Value = Vec<String>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        write!(formatter, "a map of hex storage key-value pairs")
+    }
+
+    fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = Vec::new();
+        while let Some(key) = access.next_key::<String>()? {
+            if key.starts_with(self.prefix) {
+                keys.push(key);
+            }
+            access.next_value::<IgnoredAny>()?;
+        }
+        Ok(keys)
+    }
+}
+
+fn read_keys_with_prefix(path: &Path, prefix: &str) -> Result<Vec<String>> {
+    let file = File::open(path)?;
+    let mut de = serde_json::Deserializer::from_reader(BufReader::new(file));
+    KeysWithPrefix { prefix }.deserialize(&mut de).err_into()
+}
+
 /// Filters applied while streaming state into the fork's chain-spec.
 struct TopFilter {
     /// Storage entries must match one of these prefixes to be kept.
@@ -771,10 +815,14 @@ fn account_id_from_seed_hex(hex: &str) -> Result<[u8; 32], Report> {
     Ok(pair.public().0)
 }
 
+/// Substrate `Twox64Concat`: `twox_64(data) || data`.
+fn append_twox_64_concat_bytes(key: &mut Vec<u8>, data: &[u8]) {
+    key.extend_from_slice(&twox_64(data));
+    key.extend_from_slice(data);
+}
+
 fn append_twox_64_concat_u64(key: &mut Vec<u8>, chain_key: u64) {
-    let le = chain_key.to_le_bytes();
-    key.extend_from_slice(&twox_64(&le));
-    key.extend_from_slice(&le);
+    append_twox_64_concat_bytes(key, &chain_key.to_le_bytes());
 }
 
 /// Substrate `Blake2_128Concat`: `blake2_128(data) || data`.
@@ -869,6 +917,65 @@ fn system_account_storage_key(account_id: &[u8; 32]) -> String {
     key.extend_from_slice(&twox_128(b"Account"));
     append_blake2_128_concat_bytes(&mut key, account_id.as_slice());
     key.to_hex()
+}
+
+/// `PalletId` of `pallet_nomination_pools` in the creditcoin3 runtime
+/// (`NomPoolsPalletId` in `runtime/src/lib.rs`).
+const NOM_POOLS_PALLET_ID: &[u8; 8] = b"ctcnopls";
+
+/// The bonded account of a nomination pool, i.e.
+/// `PalletId::into_sub_account_truncating((AccountType::Bonded, pool_id))`:
+/// `b"modl" ++ pallet_id ++ 0x00 ++ pool_id as u32 LE`, zero-padded to 32 bytes.
+fn pool_bonded_account(pool_id: u32) -> [u8; 32] {
+    let mut account = [0u8; 32];
+    account[..4].copy_from_slice(b"modl");
+    account[4..12].copy_from_slice(NOM_POOLS_PALLET_ID);
+    // account[12] is 0x00, the encoding of AccountType::Bonded
+    account[13..17].copy_from_slice(&pool_id.to_le_bytes());
+    account
+}
+
+/// `Staking.Bonded(account)`: `twox_128` + `twox_128` + `twox_64_concat`(account).
+fn staking_bonded_key(account: &[u8; 32]) -> String {
+    let mut key = Vec::with_capacity(16 + 16 + 8 + 32);
+    key.extend_from_slice(&twox_128(b"Staking"));
+    key.extend_from_slice(&twox_128(b"Bonded"));
+    append_twox_64_concat_bytes(&mut key, account);
+    key.to_hex()
+}
+
+/// `Staking.Ledger(account)`: `twox_128` + `twox_128` + `blake2_128_concat`(account).
+fn staking_ledger_key(account: &[u8; 32]) -> String {
+    let mut key = Vec::with_capacity(16 + 16 + 16 + 32);
+    key.extend_from_slice(&twox_128(b"Staking"));
+    key.extend_from_slice(&twox_128(b"Ledger"));
+    append_blake2_128_concat_bytes(&mut key, account);
+    key.to_hex()
+}
+
+/// `Staking.Payee(account)`: `twox_128` + `twox_128` + `twox_64_concat`(account).
+fn staking_payee_key(account: &[u8; 32]) -> String {
+    let mut key = Vec::with_capacity(16 + 16 + 8 + 32);
+    key.extend_from_slice(&twox_128(b"Staking"));
+    key.extend_from_slice(&twox_128(b"Payee"));
+    append_twox_64_concat_bytes(&mut key, account);
+    key.to_hex()
+}
+
+/// The `Staking` storage keys preserved for a nomination pool's bonded account.
+struct PoolStakingKeys {
+    bonded: String,
+    ledger: String,
+    payee: String,
+}
+
+/// Pool id from a `NominationPools.BondedPools` storage key:
+/// the `Twox64Concat` suffix is an 8-byte hash followed by the `u32` pool id LE.
+fn pool_id_from_bonded_pools_key(key: &str, bonded_pools_prefix: &str) -> Option<u32> {
+    let suffix = key.strip_prefix(bonded_pools_prefix)?;
+    let raw = hex::decode(suffix).ok()?;
+    let id = u32::from_le_bytes(raw.get(8..12)?.try_into().ok()?);
+    (raw.len() == 12).then_some(id)
 }
 
 /// 10 CTC in planck (1 CTC = 1e18 planck; matches node `chain_spec` `UNITS`).
@@ -1174,6 +1281,42 @@ async fn main() -> Result<()> {
     let alice_acct_key = system_account_storage_key(&alice);
     let bob_acct_key = system_account_storage_key(&bob);
 
+    // The Staking pallet is dropped from the fork (the fork runs with the dev
+    // chain's validators), but NominationPools state is carried over. A pool
+    // whose bonded account has no active staking ledger is bricked:
+    // join/bond-extra/unbond all fail with `nominationPools.OverflowRisk`
+    // because the pool's active stake reads as zero. Preserve the per-pool-
+    // account Staking.{Bonded, Ledger, Payee} entries from the original chain;
+    // the matching balance locks are carried over with the Balances pallet.
+    // Skip preservation when the fork does not carry the pools themselves
+    // (`--pallets`/`--exclude-pallets` without NominationPools) or their
+    // balance locks (without Balances): orphan staking entries, or a ledger
+    // whose funds the balances pallet does not lock, are worse than dead pools.
+    let bonded_pools_prefix = storage_prefix("NominationPools", "BondedPools");
+    let preserve_pools = filter.keeps_storage_key(&bonded_pools_prefix)
+        && filter.keeps_storage_key(&storage_prefix("Balances", "Locks"));
+    let pool_ids: Vec<u32> = match &storage_path {
+        Some(path) if preserve_pools => read_keys_with_prefix(path, &bonded_pools_prefix)?
+            .iter()
+            .filter_map(|key| pool_id_from_bonded_pools_key(key, &bonded_pools_prefix))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let pool_staking_keys: Vec<(u32, PoolStakingKeys)> = pool_ids
+        .iter()
+        .map(|&pool_id| {
+            let account = pool_bonded_account(pool_id);
+            (
+                pool_id,
+                PoolStakingKeys {
+                    bonded: staking_bonded_key(&account),
+                    ledger: staking_ledger_key(&account),
+                    payee: staking_payee_key(&account),
+                },
+            )
+        })
+        .collect();
+
     let mut wanted = HashSet::from([code_key.clone()]);
     if cli.usc {
         wanted.extend([
@@ -1181,6 +1324,9 @@ async fn main() -> Result<()> {
             alice_acct_key.clone(),
             bob_acct_key.clone(),
         ]);
+    }
+    for (_, keys) in &pool_staking_keys {
+        wanted.extend([keys.bonded.clone(), keys.ledger.clone(), keys.payee.clone()]);
     }
     let selected = match &storage_path {
         Some(path) => read_selected_keys(path, &wanted)?,
@@ -1285,6 +1431,35 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Re-add the nomination pools' staking entries after the dev-validator
+    // injection so they are not dropped with the rest of the Staking pallet.
+    // Known imperfection: a preserved ledger's `unlocking` chunks reference the
+    // original chain's era numbers, which the fork restarts near zero, so
+    // in-flight unbonds stay unwithdrawable and occupy MaxUnlockingChunks
+    // slots. Fresh join/bond-extra/unbond all work.
+    let mut preserved_count = 0usize;
+    for (pool_id, keys) in &pool_staking_keys {
+        if !selected.contains_key(&keys.ledger) {
+            println!(
+                "{}",
+                style(format!(
+                    "warning: nomination pool {pool_id} has no staking ledger on the original chain; it will not be functional on the fork"
+                ))
+                .yellow()
+            );
+            continue;
+        }
+        for key in [&keys.bonded, &keys.ledger, &keys.payee] {
+            if let Some(value) = selected.get(key) {
+                overrides.insert(key.clone(), value.clone().into());
+            }
+        }
+        preserved_count += 1;
+    }
+    if preserved_count > 0 {
+        println!("Preserved staking ledgers for {preserved_count} nomination pool(s)");
+    }
+
     println!("{}", style("Writing chain specification for fork").green());
 
     let out = ChainSpecOut {
@@ -1343,5 +1518,43 @@ mod usc_storage_key_tests {
         let prefix = attestors_storage_key_prefix(ck);
         let key = attestors_storage_key(&alice, ck);
         assert!(key.starts_with(&prefix), "{key} should start with {prefix}");
+    }
+}
+
+#[cfg(test)]
+mod nomination_pool_tests {
+    use super::*;
+
+    // Reference values taken from creditcoin3 mainnet metadata
+    // (api.query.staking.{bonded,ledger,payee}.key(<pool 1 bonded account>)).
+    const POOL_1_BONDED_KEY: &str = "0x5f3e4907f716ac89b6347d15ececedca3ed14b45ed20d054f05e37e2542cfe70be10eebcf73b20046d6f646c6374636e6f706c730001000000000000000000000000000000000000";
+    const POOL_1_LEDGER_KEY: &str = "0x5f3e4907f716ac89b6347d15ececedca422adb579f1dbf4f3886c5cfa3bb8cc42acb447655f8ef2945c8a5b0833158eb6d6f646c6374636e6f706c730001000000000000000000000000000000000000";
+    const POOL_1_PAYEE_KEY: &str = "0x5f3e4907f716ac89b6347d15ececedca9220e172bed316605f73f1ff7b4ade98be10eebcf73b20046d6f646c6374636e6f706c730001000000000000000000000000000000000000";
+
+    #[test]
+    fn pool_bonded_account_matches_mainnet() {
+        let account = pool_bonded_account(1);
+        // modl ++ ctcnopls ++ 0x00 ++ 1u32 LE, zero-padded
+        assert_eq!(
+            account.to_hex(),
+            "0x6d6f646c6374636e6f706c730001000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn pool_staking_keys_match_mainnet() {
+        let account = pool_bonded_account(1);
+        assert_eq!(staking_bonded_key(&account), POOL_1_BONDED_KEY);
+        assert_eq!(staking_ledger_key(&account), POOL_1_LEDGER_KEY);
+        assert_eq!(staking_payee_key(&account), POOL_1_PAYEE_KEY);
+    }
+
+    #[test]
+    fn pool_id_roundtrips_through_bonded_pools_key() {
+        // Twox64Concat-hashed BondedPools key for pool 1, from mainnet:
+        // api.query.nominationPools.bondedPools.key(1)
+        let key = "0x7a6d38deaa01cb6e76ee69889f1696271f7c4e57dc49e4d6d003b730a7894f325153cb1f00942ff401000000";
+        let prefix = storage_prefix("NominationPools", "BondedPools");
+        assert_eq!(pool_id_from_bonded_pools_key(key, &prefix), Some(1));
     }
 }
