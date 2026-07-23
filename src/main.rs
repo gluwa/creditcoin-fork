@@ -1196,8 +1196,13 @@ async fn main() -> Result<()> {
     // Make sure that the genesis state is different
     overrides.insert("0xdeadbeef".to_owned(), "0x1".into());
 
+    // Always set the sudo key to Alice, replacing the original chain's key.
+    // creditcoin3's runtime-upgrade CI forks testnet/mainnet without `--usc`
+    // and submits sudo calls signed by //Alice against the fork.
+    overrides.insert(storage_prefix("Sudo", "Key"), alice.to_hex().into());
+
     if cli.usc {
-        // USC component: Alice and Bob from hex seeds; set Sudo key and Attestation pallet genesis
+        // USC component: Alice and Bob from hex seeds; set Attestation pallet genesis
         let ck = cli.usc_chain_key;
 
         // Reads a merged-state value the way the old in-memory merge saw it:
@@ -1210,8 +1215,6 @@ async fn main() -> Result<()> {
             }
             spec.genesis.raw.top.get(key).cloned()
         };
-
-        overrides.insert(storage_prefix("Sudo", "Key"), alice.to_hex().into());
 
         let alice_bls = bls_public_key_from_hex_seed_uri(ALICE_SEED_HEX)?;
         let bob_bls = bls_public_key_from_hex_seed_uri(BOB_SEED_HEX)?;
