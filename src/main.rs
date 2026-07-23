@@ -167,7 +167,7 @@ impl RawClient {
 fn new_http_client(url: &str) -> Result<RawClient> {
     let client = jsonrpsee::http_client::HttpClientBuilder::default()
         .max_request_body_size(MAX_WS_MESSAGE_SIZE)
-        .request_timeout(std::time::Duration::from_mins(1))
+        .request_timeout(std::time::Duration::from_secs(60))
         .build(url)
         .err_into()?;
     Ok(RawClient::Http(Arc::new(client)))
