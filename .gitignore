@@ -2,5 +2,7 @@
 /data
 fork.json
 fork/
-./idea
-./tasks
+.idea/
+tasks/
+.claude/
+.tokensave/
