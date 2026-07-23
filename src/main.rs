@@ -145,8 +145,11 @@ impl RawClient {
 
     /// `state_getKeysPaged`: all keys (hex) after `start_key`, full keyspace.
     async fn keys_paged(&self, count: u32, start_key: &str, at: &str) -> Result<Vec<String>> {
-        self.request("state_getKeysPaged", rpc_params!["0x", count, start_key, at])
-            .await
+        self.request(
+            "state_getKeysPaged",
+            rpc_params!["0x", count, start_key, at],
+        )
+        .await
     }
 
     /// `state_getStorage`: a single value (hex) at `at`.
@@ -164,7 +167,7 @@ impl RawClient {
 fn new_http_client(url: &str) -> Result<RawClient> {
     let client = jsonrpsee::http_client::HttpClientBuilder::default()
         .max_request_body_size(MAX_WS_MESSAGE_SIZE)
-        .request_timeout(std::time::Duration::from_secs(60))
+        .request_timeout(std::time::Duration::from_mins(1))
         .build(url)
         .err_into()?;
     Ok(RawClient::Http(Arc::new(client)))
@@ -228,8 +231,8 @@ fn pos_sub(a: &RangePos, b: &RangePos) -> Option<RangePos> {
     let mut out = [0u8; RANGE_BYTES];
     let mut borrow = 0i16;
     for i in (0..RANGE_BYTES).rev() {
-        let d = a[i] as i16 - b[i] as i16 - borrow;
-        out[i] = (d & 0xff) as u8;
+        let d = i16::from(a[i]) - i16::from(b[i]) - borrow;
+        out[i] = d.to_le_bytes()[0];
         borrow = i16::from(d < 0);
     }
     (borrow == 0).then_some(out)
@@ -239,7 +242,7 @@ fn pos_add(a: &RangePos, b: &RangePos) -> Option<RangePos> {
     let mut out = [0u8; RANGE_BYTES];
     let mut carry = 0u16;
     for i in (0..RANGE_BYTES).rev() {
-        let s = a[i] as u16 + b[i] as u16 + carry;
+        let s = u16::from(a[i]) + u16::from(b[i]) + carry;
         out[i] = (s & 0xff) as u8;
         carry = s >> 8;
     }
@@ -299,12 +302,15 @@ fn density_split_points(
 /// sequentially. Instead, ranges split dynamically — whenever a range yields a
 /// full page, its unscanned remainder is halved and queued for another worker,
 /// so dense regions keep splitting until every worker is busy.
+#[allow(clippy::too_many_lines)]
 async fn fetch_all_keys(
     pool: &NodePool,
     at: &str,
     key_scan_concurrency: usize,
 ) -> Result<Vec<String>> {
-    let spinner = Mutex::new(cli::ProgressBarManager::new_spinner("Fetching storage keys")?);
+    let spinner = Mutex::new(cli::ProgressBarManager::new_spinner(
+        "Fetching storage keys",
+    )?);
 
     // Ranges are (start_exclusive, end_inclusive), 0x-hex. Seed one range per
     // first byte for a fast warmup.
@@ -385,8 +391,7 @@ async fn fetch_all_keys(
                             // most of each response.
                             let deficit = {
                                 let queued = queue.lock().unwrap().len();
-                                workers
-                                    .saturating_sub(queued + in_progress.load(Ordering::SeqCst))
+                                workers.saturating_sub(queued + in_progress.load(Ordering::SeqCst))
                             };
                             if deficit > 0 {
                                 // One chunk per starved worker; each spawned
@@ -423,10 +428,7 @@ async fn fetch_all_keys(
         .try_collect::<Vec<()>>();
     scan.await?;
 
-    spinner
-        .into_inner()
-        .unwrap()
-        .finish_with_message("Done");
+    spinner.into_inner().unwrap().finish_with_message("Done");
 
     Ok(all_keys.into_inner().unwrap())
 }
@@ -781,7 +783,7 @@ fn append_blake2_128_concat_bytes(key: &mut Vec<u8>, data: &[u8]) {
     key.extend_from_slice(data);
 }
 
-/// Blake2_128Concat for SCALE-encoded `u64` chain key (maps that use `Blake2_128Concat, ChainKey`).
+/// `Blake2_128Concat` for SCALE-encoded `u64` chain key (maps that use `Blake2_128Concat, ChainKey`).
 fn append_blake2_128_concat_u64(key: &mut Vec<u8>, chain_key: u64) {
     let encoded = chain_key.to_le_bytes();
     append_blake2_128_concat_bytes(key, &encoded);
@@ -796,8 +798,8 @@ fn attestors_storage_key_prefix(chain_key: u64) -> String {
     key.to_hex()
 }
 
-/// Attestation pallet: Attestors(chain_key, account_id).
-/// Storage key = twox_128("Attestation") + twox_128("Attestors") + twox_64_concat(chain_key) + blake2_128_concat(account_id).
+/// Attestation pallet: `Attestors(chain_key, account_id)`.
+/// Storage key = `twox_128("Attestation") + twox_128("Attestors") + twox_64_concat(chain_key) + blake2_128_concat(account_id)`.
 fn attestors_storage_key(account_id: &[u8; 32], chain_key: u64) -> String {
     use blake2::digest::{Update, VariableOutput};
     let mut key = Vec::with_capacity(32 + 8 + 8 + 16 + 32);
@@ -833,7 +835,7 @@ fn attestor_value_with_bls(bls_public_key: &[u8; 48], stash: &[u8; 32]) -> Strin
     v.to_hex()
 }
 
-/// ActiveAttestors(chain_key): twox_128 + twox_128 + blake2_128_concat(SCALE u64).
+/// `ActiveAttestors(chain_key)`: `twox_128` + `twox_128` + `blake2_128_concat`(SCALE `u64`).
 fn active_attestors_storage_key(chain_key: u64) -> String {
     let mut key = Vec::with_capacity(16 + 16 + 16 + 8);
     key.extend_from_slice(&twox_128(b"Attestation"));
@@ -842,7 +844,7 @@ fn active_attestors_storage_key(chain_key: u64) -> String {
     key.to_hex()
 }
 
-/// TargetSampleSize(chain_key): twox_128 + twox_128 + blake2_128_concat(SCALE u64).
+/// `TargetSampleSize(chain_key)`: `twox_128` + `twox_128` + `blake2_128_concat`(SCALE `u64`).
 fn target_sample_size_storage_key(chain_key: u64) -> String {
     let mut key = Vec::with_capacity(16 + 16 + 16 + 8);
     key.extend_from_slice(&twox_128(b"Attestation"));
@@ -860,7 +862,7 @@ fn active_attestors_value(alice: &[u8; 32], bob: &[u8; 32]) -> String {
     v.to_hex()
 }
 
-/// `System.Account(AccountId)`: twox_128 + twox_128 + blake2_128_concat(AccountId bytes).
+/// `System.Account(AccountId)`: `twox_128` + `twox_128` + `blake2_128_concat`(`AccountId` bytes).
 fn system_account_storage_key(account_id: &[u8; 32]) -> String {
     let mut key = Vec::with_capacity(16 + 16 + 16 + 32);
     key.extend_from_slice(&twox_128(b"System"));
@@ -873,7 +875,7 @@ fn system_account_storage_key(account_id: &[u8; 32]) -> String {
 const TEN_CTC_PLANCK: u128 = 10 * 1_000_000_000_000_000_000;
 
 /// `pallet_balances::ExtraFlags::default()` — new balance ref-counting is active.
-const BALANCE_EXTRA_FLAGS: u128 = 0x80000000_00000000_00000000_00000000u128;
+const BALANCE_EXTRA_FLAGS: u128 = 0x8000_0000_0000_0000_0000_0000_0000_0000u128;
 
 /// `frame_system::AccountInfo` + `pallet_balances::AccountData` SCALE encoding (nonce, refcounts, free/reserved/frozen/flags).
 fn system_account_info_with_free_balance(free: u128) -> String {
@@ -904,7 +906,7 @@ fn u128_le_from_first_16(bytes: &[u8]) -> Option<u128> {
     Some(u128::from_le_bytes(arr))
 }
 
-/// `free` field inside `AccountInfo` (offset 16: after nonce + 3× RefCount).
+/// `free` field inside `AccountInfo` (offset 16: after nonce + 3× `RefCount`).
 fn free_balance_from_account_storage(bytes: &[u8]) -> Option<u128> {
     if bytes.len() < 32 {
         return None;
@@ -1041,9 +1043,17 @@ fn fetch_http_url(http_rpc: Option<&str>, ws_url: &str) -> Option<String> {
 
 /// The fork always replaces these pallets' state with the dev chain's so that
 /// Alice is the sole validator.
-const VALIDATOR_PALLETS: [&str; 6] = ["Babe", "Grandpa", "Session", "Staking", "ImOnline", "VoterList"];
+const VALIDATOR_PALLETS: [&str; 6] = [
+    "Babe",
+    "Grandpa",
+    "Session",
+    "Staking",
+    "ImOnline",
+    "VoterList",
+];
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     color_eyre::install()?;
 

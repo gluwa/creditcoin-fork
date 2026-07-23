@@ -117,12 +117,12 @@ pub struct Cli {
     #[clap(long)]
     pub no_default_excludes: bool,
 
-    /// If set, inject USC-related genesis: Sudo key (Alice), Alice/Bob balances and BLS keys,
-    /// Attestation (`Attestors` for `--usc-chain-key` only, ActiveAttestors, TargetSampleSize),
+    /// If set, inject USC-related genesis: Alice/Bob balances and BLS keys,
+    /// Attestation (`Attestors` for `--usc-chain-key` only, `ActiveAttestors`, `TargetSampleSize`),
     /// clear Randomness pallet keys, using the configured Alice/Bob hex seeds.
     #[clap(long)]
     pub usc: bool,
-    /// USC: attestation pallet `chain_key` (ActiveAttestors, TargetSampleSize, Attestors).
+    /// USC: attestation pallet `chain_key` (`ActiveAttestors`, `TargetSampleSize`, `Attestors`).
     /// Only used when `--usc` is set. Default: 3.
     #[clap(long, default_value_t = 3)]
     pub usc_chain_key: u64,
