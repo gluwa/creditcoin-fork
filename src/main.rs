@@ -302,7 +302,7 @@ async fn main() -> Result<()> {
         .name
         .unwrap_or_else(|| orig_spec.name.joined_with("-fork"));
     spec.id = cli.id.unwrap_or_else(|| orig_spec.id.joined_with("-fork"));
-    spec.protocol_id = orig_spec.protocol_id.clone();
+    spec.protocol_id.clone_from(&orig_spec.protocol_id);
 
     let mut excludes: HashSet<&str> = if cli.no_default_excludes {
         HashSet::default()
